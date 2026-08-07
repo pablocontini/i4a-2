@@ -51,10 +51,11 @@ esp_err_t device_wifi_init() {
   return ESP_OK;
 }
 
-void device_init(DevicePtr device_ptr, const char *device_uuid, uint8_t device_orientation, const char *wifi_network_prefix, const char *wifi_network_password, uint8_t ap_channel_to_emit, uint8_t ap_max_sta_connections, uint8_t device_is_root, Device_Mode mode) {
+void device_init(DevicePtr device_ptr, const char *device_uuid, uint8_t device_orientation, const char *wifi_network_prefix, const char *wifi_network_password, uint8_t ap_channel_to_emit, uint8_t ap_max_sta_connections, uint8_t device_is_root, uint8_t device_is_apsta, Device_Mode mode) {
   device_ptr->mode = mode;
   device_ptr->state = d_inactive;
   device_ptr->device_is_root = device_is_root;
+  device_ptr->device_is_apsta = device_is_apsta;
   device_ptr->device_orientation = device_orientation;
 
   AccessPoint ap = {};
@@ -76,12 +77,6 @@ void device_init(DevicePtr device_ptr, const char *device_uuid, uint8_t device_o
     device_init_station(device_ptr, wifi_network_prefix, device_orientation, device_uuid, wifi_network_password);
   }
 
-  if(mode == AP_STATION){
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-    device_init_ap(device_ptr, ap_channel_to_emit, wifi_network_prefix, device_uuid, wifi_network_password, ap_max_sta_connections, device_orientation, device_is_root);
-    device_init_station(device_ptr, wifi_network_prefix, device_orientation, device_uuid, wifi_network_password);
-  }
-
 }
 
 void device_init_ap(DevicePtr device_ptr, uint8_t channel, const char *wifi_network_prefix ,const char *device_uuid, const char *password, uint8_t max_sta_connections, uint16_t orientation, uint8_t is_root) {
@@ -98,11 +93,11 @@ void device_init_ap(DevicePtr device_ptr, uint8_t channel, const char *wifi_netw
 
   ESP_LOGI(LOGGING_TAG, "Initializing AP with SSID: %s", wifi_ssid);
 
-  ap_init(device_ptr->access_point_ptr, channel, wifi_ssid, password, max_sta_connections, is_center, device_ptr->mode == AP_STATION);
+  ap_init(device_ptr->access_point_ptr, channel, wifi_ssid, password, max_sta_connections, is_center, device_ptr->device_is_apsta);
 };
 
 void device_init_station(DevicePtr device_ptr, const char* wifi_ssid_like, uint16_t orientation, char* device_uuid, const char* password) {
-  station_init(device_ptr->station_ptr, wifi_ssid_like, orientation, device_uuid, password, device_ptr->mode == AP_STATION);
+  station_init(device_ptr->station_ptr, wifi_ssid_like, orientation, device_uuid, password, device_ptr->device_is_apsta);
 };
 
 void device_set_network_ap(DevicePtr device_ptr, const char *network_cidr, const char *network_gateway, const char *network_mask) {
@@ -115,11 +110,6 @@ void device_reset(DevicePtr device_ptr) {
       device_stop_ap(device_ptr);
     }
     if (device_ptr->mode == STATION) {
-      device_disconnect_station(device_ptr);
-      device_stop_station(device_ptr);
-    }
-    if (device_ptr->mode == AP_STATION) {
-      device_stop_ap(device_ptr);
       device_disconnect_station(device_ptr);
       device_stop_station(device_ptr);
     }
@@ -140,10 +130,6 @@ void device_destroy_netif(DevicePtr device_ptr){
     station_destroy_netif(device_ptr->station_ptr);
   }
 
-  if (device_ptr->mode == AP_STATION) {
-    ap_destroy_netif(device_ptr->access_point_ptr);
-    station_destroy_netif(device_ptr->station_ptr);
-  }
 }
 
 // AP
@@ -271,14 +257,6 @@ esp_netif_t *device_get_netif(DevicePtr device_ptr){
     return device_ptr->station_ptr->netif;
   }
 
-  if(device_ptr->mode == AP_STATION) {
-    if(device_ptr->station_ptr->is_fully_connected){
-      return device_ptr->station_ptr->netif;
-    } else {
-      return device_ptr->access_point_ptr->netif;
-    }
-  }
-
   return NULL;
 }
 
@@ -292,14 +270,6 @@ bool device_send_wireless_message(DevicePtr device_ptr, const uint8_t *msg, uint
     return client_send_message(msg, len);
   }
 
-  if(device_ptr->mode == AP_STATION){
-    if(device_ptr->station_ptr->is_fully_connected){
-      return client_send_message(msg, len);
-    } else {
-      return server_send_message(msg, len);
-    }
-  }
-
   return false;
 }
 
@@ -310,14 +280,6 @@ bool device_is_point_to_point_message(DevicePtr device_ptr, uint32_t dst) {
 
   if(device_ptr->mode == STATION){
     return ((dst & device_ptr->station_ptr->sta_mask) == device_ptr->station_ptr->sta_subnet);
-  }
-
-  if(device_ptr->mode == AP_STATION){
-    if(device_ptr->station_ptr->is_fully_connected){
-      return ((dst & device_ptr->station_ptr->sta_mask) == device_ptr->station_ptr->sta_subnet);
-    } else {
-      return ((dst & device_ptr->access_point_ptr->ap_mask) == device_ptr->access_point_ptr->ap_subnet);
-    }
   }
 
   return false;
@@ -347,39 +309,17 @@ int8_t device_get_rssi(DevicePtr device_ptr) {
     }
   }
 
-  if (device_ptr->mode == AP_STATION) {
-    if (device_ptr->station_ptr->is_fully_connected) {
-      wifi_ap_record_t ap_info = {};
-      esp_err_t err = esp_wifi_sta_get_ap_info(&ap_info);
-
-      if (err == ESP_OK) {
-        return ap_info.rssi;
-      }  else {
-        return -127;
-      }
-    } else {
-      wifi_sta_list_t list;
-      esp_err_t err = esp_wifi_ap_get_sta_list(&list);
-
-      if (err == ESP_OK && list.num > 0) {
-        return list.sta[0].rssi;
-      } else {
-        return -127;
-      }
-    }
-  }
-
   return -127;
 }
 
 const char *device_get_link_name(DevicePtr device_ptr) {
-  if (device_ptr->mode == STATION || device_ptr->mode == AP_STATION) {
+  if (device_ptr->mode == STATION) {
     if (device_ptr->station_ptr->is_fully_connected) {
       return (const char*)device_ptr->station_ptr->wifi_ap_found.ssid;
     }
   }
 
-  if (device_ptr->mode == AP || device_ptr->mode == AP_STATION) {
+  if (device_ptr->mode == AP) {
     if (device_ptr->access_point_ptr->initialized) {
       return device_ptr->access_point_ptr->ssid;
     }
@@ -389,13 +329,13 @@ const char *device_get_link_name(DevicePtr device_ptr) {
 }
 
 uint8_t device_get_channel(DevicePtr device_ptr) {
-  if (device_ptr->mode == STATION || device_ptr->mode == AP_STATION) {
+  if (device_ptr->mode == STATION) {
     if (device_ptr->station_ptr->is_fully_connected) {
       return device_ptr->station_ptr->wifi_ap_found.primary;
     }
   }
 
-  if (device_ptr->mode == AP || device_ptr->mode == AP_STATION) {
+  if (device_ptr->mode == AP) {
     if (device_ptr->access_point_ptr->initialized) {
       return device_ptr->access_point_ptr->channel;
     }
@@ -428,7 +368,7 @@ void device_disable_station(DevicePtr device_ptr) {
   }
 
   device_ptr->sta_lock = true;
-  if (device_ptr->mode == STATION || device_ptr->mode == AP_STATION) {
+  if (device_ptr->mode == STATION) {
     station_disconnect(device_ptr->station_ptr);
   }
 }
@@ -449,7 +389,7 @@ void device_disable_ap(DevicePtr device_ptr) {
   }
   
   device_ptr->ap_lock = true;
-  if (device_ptr->mode == AP || device_ptr->mode == AP_STATION) {
+  if (device_ptr->mode == AP) {
     ap_disconnect_all_stations(device_ptr->access_point_ptr);
   }
 }
@@ -480,5 +420,5 @@ bool device_is_ap_locked(DevicePtr device_ptr) {
 }
 
 bool device_is_apsta(DevicePtr device_ptr){
-  return device_ptr->mode == AP_STATION;
+  return device_ptr->device_is_apsta;
 }

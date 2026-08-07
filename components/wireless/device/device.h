@@ -15,7 +15,6 @@ extern "C" {
 typedef enum {
   AP = 0,  // Access Point is active
   STATION, // Access Point is inactive
-  AP_STATION,
   NAN
 } Device_Mode;
 
@@ -33,6 +32,7 @@ struct Device {
   char device_uuid[32];
   uint8_t device_orientation;
   uint8_t device_is_root;
+  uint8_t device_is_apsta;
   char ssid[32];
   char password[64];
   uint8_t channel;
@@ -51,7 +51,7 @@ typedef struct Device* DevicePtr;
 
 // Methods
 esp_err_t device_wifi_init();
-void device_init(DevicePtr device_ptr, const char *device_uuid, uint8_t device_orientation, const char *wifi_network_prefix, const char *wifi_network_password, uint8_t ap_channel_to_emit, uint8_t softap_max_sta_connections, uint8_t device_is_root, Device_Mode mode);
+void device_init(DevicePtr device_ptr, const char *device_uuid, uint8_t device_orientation, const char *wifi_network_prefix, const char *wifi_network_password, uint8_t ap_channel_to_emit, uint8_t softap_max_sta_connections, uint8_t device_is_root, uint8_t device_is_apsta, Device_Mode mode);
 void device_init_ap(DevicePtr device_ptr, uint8_t channel, const char *wifi_network_prefix ,const char *device_uuid, const char *password, uint8_t max_sta_connections, uint16_t orientation, uint8_t is_root);
 void device_init_station(DevicePtr device_ptr, const char* wifi_ssid_like, uint16_t orientation, char* device_uuid, const char* password);
 void device_set_mode(DevicePtr device_ptr, Device_Mode mode);

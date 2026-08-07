@@ -40,6 +40,7 @@ typedef struct node {
   const char *node_device_mac;
   node_device_orientation_t node_device_orientation;
   bool node_device_is_center_root;
+  bool node_device_is_apsta;
   uint32_t node_device_subnet;
   uint32_t node_device_mask;
 } node_t;
@@ -108,6 +109,7 @@ void node_setup(void){
   node_ptr->node_device_mac = rm_get_mac();
   node_ptr->node_device_uuid = rm_get_uuid();
   node_ptr->node_device_is_center_root = rm_is_root();
+  node_ptr->node_device_is_apsta = false;
   node_traffic_init();
   im_scheduler_start();
 }
@@ -120,7 +122,7 @@ void node_set_as_sta(){
   char *wifi_network_prefix = NODE_NAME_PREFIX;
   char *wifi_network_password = NODE_LINK_PASSWORD;
 
-  device_init(node_ptr->node_device_ptr, node_ptr->node_device_uuid, node_ptr->node_device_orientation, wifi_network_prefix, wifi_network_password, 6, 4, (uint8_t)node_ptr->node_device_is_center_root, STATION);
+  device_init(node_ptr->node_device_ptr, node_ptr->node_device_uuid, node_ptr->node_device_orientation, wifi_network_prefix, wifi_network_password, 6, 4, (uint8_t)node_ptr->node_device_is_center_root, (uint8_t)node_ptr->node_device_is_apsta, STATION);
 
   // Wait in sequence to avoid current peaks while STA starts up
   vTaskDelay(pdMS_TO_TICKS(node_ptr->node_device_orientation * AP_STA_DELAY_SECONDS * 1000));
@@ -183,13 +185,14 @@ void node_set_as_ap(uint32_t network, uint32_t mask){
 
   // Root always AP only
   if (node_ptr->node_device_orientation == NODE_DEVICE_ORIENTATION_CENTER || node_ptr->node_device_is_center_root){
-    device_init(node_ptr->node_device_ptr, node_ptr->node_device_uuid, node_ptr->node_device_orientation, wifi_network_prefix, wifi_network_password, ap_channel_to_emit, ap_max_sta_connections, (uint8_t)node_ptr->node_device_is_center_root, AP);
+    device_init(node_ptr->node_device_ptr, node_ptr->node_device_uuid, node_ptr->node_device_orientation, wifi_network_prefix, wifi_network_password, ap_channel_to_emit, ap_max_sta_connections, (uint8_t)node_ptr->node_device_is_center_root, (uint8_t)node_ptr->node_device_is_apsta, AP);
     device_set_network_ap(node_ptr->node_device_ptr, network_cidr, network_gateway, network_mask);
     device_start_ap(node_ptr->node_device_ptr);
     device_set_max_tx_power(node_ptr->node_device_ptr, 80);
   } else {
     // Non root should do AP+STA, currently set to AP only due to performance issues on AP+STA mode while we look for a different way to implement it
-    device_init(node_ptr->node_device_ptr, node_ptr->node_device_uuid, node_ptr->node_device_orientation, wifi_network_prefix, wifi_network_password, ap_channel_to_emit, ap_max_sta_connections, (uint8_t)node_ptr->node_device_is_center_root, AP);
+    node_ptr->node_device_is_apsta = true;
+    device_init(node_ptr->node_device_ptr, node_ptr->node_device_uuid, node_ptr->node_device_orientation, wifi_network_prefix, wifi_network_password, ap_channel_to_emit, ap_max_sta_connections, (uint8_t)node_ptr->node_device_is_center_root, (uint8_t)node_ptr->node_device_is_apsta, AP);
     device_set_network_ap(node_ptr->node_device_ptr, network_cidr, network_gateway, network_mask);
     device_start_ap(node_ptr->node_device_ptr);
     device_set_max_tx_power(node_ptr->node_device_ptr, 80);

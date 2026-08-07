@@ -56,12 +56,7 @@ static bool is_network_allowed(char* device_uuid, char* network_prefix, char* ne
       return false;
   }
 
-  // Finish checking if it's not on APSTA mode, otherwise check to prevent redundant connections
-  if(is_apsta){
-    return strncmp(network_name + SSID_UUID_OFFSET, device_uuid, UUID_LEN) < 0;
-  } else {
-    return true;
-  }
+  return true;
 
 }
 
@@ -150,9 +145,6 @@ static void event_handler(void* arg, esp_event_base_t event_base, int32_t event_
         
         if(stationPtr->is_fully_connected){
           client_close();
-          if(stationPtr->is_apsta){
-            node_enable_ap();
-          }
           stationPtr->is_fully_connected = false;
         }
         
