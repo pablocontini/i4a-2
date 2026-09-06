@@ -138,24 +138,63 @@ GPIO 5  (CS)    ────► GPIO 15 (CS)
 - Programming: Via USB interface
 - Booting: Custom handling via FreeRTOS
 
-### 5.2 ComNetAR password portal
+### 5.2 Temporary ComNetAR portals
 
-The BOOT button (GPIO0) on the central, non-root module controls the local
-ComNetAR password portal:
+The BOOT button (GPIO0) on the central, non-root module controls one temporary
+HTTP server with separate user and administrator areas. A short press enables
+both areas for five minutes. The exact gateway address is printed when the
+server starts if firmware logs are enabled.
 
-- A short press enables the HTTP portal for five minutes. While connected to
-  ComNetAR, open the network gateway address in a browser (for example,
-  `http://10.x.x.1/`). The exact address is printed when the portal starts if
-  firmware logs are enabled.
-- Saving a valid 8-to-63-character password persists it in NVS, returns a
-  confirmation page, and reconfigures only the running ComNetAR access point.
-  Connected clients must then use the new password.
-- The portal also provides a factory-reset button with an explicit browser
-  confirmation.
-- Holding BOOT continuously for six seconds performs the same credential
-  factory reset as soon as the threshold is reached. Button transitions are
-  accepted only after remaining stable for 150 milliseconds to reject contact
-  bounce. The saved password is removed and ComNetAR becomes an open network.
+The final-user area is available at the gateway root, for example
+`http://10.x.x.1/`:
 
-Password changes do not restart the central module or trigger the node-wide
-reset manager.
+- It does not request the administrator password and does not expose a link to
+  the administrator area.
+- It lets a connected user replace the ComNetAR Wi-Fi password with a valid
+  8-to-63-character value. The password is persisted in NVS and applied only to
+  the running ComNetAR access point; connected clients must then reconnect.
+- It retains the existing Wi-Fi reset action, with an explicit browser
+  confirmation. This removes only the ComNetAR Wi-Fi password and leaves the
+  network open.
+- Both user actions require the random CSRF token generated when the temporary
+  server starts.
+
+The developer-only area is available by opening `/admin` directly, for example
+`http://10.x.x.1/admin`:
+
+- It requires its own administrator password. On the first boot after
+  provisioning or erasing NVS, the initial password is `i4a12345`. The page
+  warns while this initial credential remains active and lets an authenticated
+  administrator replace it remotely. A successful replacement invalidates the
+  current session.
+- It does not display or provide an endpoint for changing or resetting the
+  ComNetAR Wi-Fi password.
+- The administrator password is not stored as plaintext. NVS contains a random
+  salt and a PBKDF2-SHA256 verifier. Five failed logins block new attempts for
+  30 seconds. Successful logins use a random, HTTP-only session cookie scoped
+  to `/admin` and a CSRF token; both expire when the server closes or after five
+  minutes.
+- Four independent maximum transmit powers can be stored for the North, South,
+  East, and West radios. The selectable levels match the ESP-IDF v5.1.2 power
+  mapping and default to 20 dBm. The central hotspot has no stored power field.
+  Saving only updates the desired values in the central module's NVS. A
+  separate confirmation action distributes the complete configuration through
+  the reset-manager ring protocol. Each directional module stores the values
+  in its own NVS and acknowledges the transaction. Only after North, South,
+  East, and West have all acknowledged does the central module broadcast the
+  existing node reset and restart itself. Each directional radio applies its
+  own stored value during the next boot; the central ComNetAR hotspot remains
+  fixed at the existing 20 dBm setting. A failed acknowledgement or a 20-second
+  timeout cancels the coordinated reset so the administrator can retry.
+
+Holding BOOT continuously for six seconds resets only the ComNetAR Wi-Fi
+credentials as soon as the threshold is reached. Button transitions are
+accepted only after remaining stable for 150 milliseconds to reject contact
+bounce. Administrative settings remain unchanged. Password changes do not
+restart the central module or trigger the node-wide reset manager; only the
+explicit antenna-power apply action does.
+
+Both areas currently use plain HTTP, so credentials are not encrypted in
+transit. Production deployments should add HTTPS and NVS encryption if
+attackers on the local network or with physical flash access are part of the
+threat model.

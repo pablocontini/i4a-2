@@ -84,6 +84,18 @@ static esp_err_t node_apply_house_ap_password(const char *password, void *contex
   return ESP_OK;
 }
 
+static esp_err_t node_schedule_antenna_power_update(
+    const uint8_t *power_qdbm, size_t count, void *context) {
+  (void)context;
+
+  if (node_ptr->node_device_orientation != NODE_DEVICE_ORIENTATION_CENTER ||
+      node_ptr->node_device_is_center_root) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  return rm_schedule_antenna_power_update(power_qdbm, count);
+}
+
 void node_setup(void){
   ESP_ERROR_CHECK(node_init_event_queues());
   ESP_ERROR_CHECK(node_start_event_tasks());
@@ -99,6 +111,7 @@ void node_setup(void){
   vTaskDelay(pdMS_TO_TICKS(node_ptr->node_device_orientation * CALIBRATION_DELAY_SECONDS * 1000));
 
   ESP_ERROR_CHECK(device_wifi_init());
+  ESP_ERROR_CHECK(rm_power_storage_init());
   ESP_ERROR_CHECK(wifi_credentials_init());
   ESP_ERROR_CHECK(ring_link_init());
 
@@ -134,6 +147,7 @@ void node_setup(void){
   if (node_ptr->node_device_orientation == NODE_DEVICE_ORIENTATION_CENTER &&
       !node_ptr->node_device_is_center_root) {
     ESP_ERROR_CHECK(config_portal_init(node_apply_house_ap_password,
+                                       node_schedule_antenna_power_update,
                                        node_ptr->node_device_ptr));
   }
 }
@@ -151,7 +165,8 @@ void node_set_as_sta(){
   // Wait in sequence to avoid current peaks while STA starts up
   vTaskDelay(pdMS_TO_TICKS(node_ptr->node_device_orientation * AP_STA_DELAY_SECONDS * 1000));
   device_start_station(node_ptr->node_device_ptr);
-  device_set_max_tx_power(node_ptr->node_device_ptr, 80);
+  device_set_max_tx_power(node_ptr->node_device_ptr,
+                          rm_get_local_antenna_power());
   device_connect_station(node_ptr->node_device_ptr);
 }
 
@@ -219,7 +234,8 @@ void node_set_as_ap(uint32_t network, uint32_t mask){
     device_init(node_ptr->node_device_ptr, node_ptr->node_device_uuid, node_ptr->node_device_orientation, wifi_network_prefix, wifi_network_password, ap_channel_to_emit, ap_max_sta_connections, (uint8_t)node_ptr->node_device_is_center_root, (uint8_t)node_ptr->node_device_is_apsta, AP);
     device_set_network_ap(node_ptr->node_device_ptr, network_cidr, network_gateway, network_mask);
     device_start_ap(node_ptr->node_device_ptr);
-    device_set_max_tx_power(node_ptr->node_device_ptr, 80);
+    device_set_max_tx_power(node_ptr->node_device_ptr,
+                            rm_get_local_antenna_power());
   }
 
   if(node_ptr->node_device_orientation == NODE_DEVICE_ORIENTATION_CENTER) {
