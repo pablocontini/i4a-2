@@ -137,3 +137,25 @@ GPIO 5  (CS)    ────► GPIO 15 (CS)
 - Operating System: FreeRTOS
 - Programming: Via USB interface
 - Booting: Custom handling via FreeRTOS
+
+### 5.2 ComNetAR password portal
+
+The BOOT button (GPIO0) on the central, non-root module controls the local
+ComNetAR password portal:
+
+- A short press enables the HTTP portal for five minutes. While connected to
+  ComNetAR, open the network gateway address in a browser (for example,
+  `http://10.x.x.1/`). The exact address is printed when the portal starts if
+  firmware logs are enabled.
+- Saving a valid 8-to-63-character password persists it in NVS, returns a
+  confirmation page, and reconfigures only the running ComNetAR access point.
+  Connected clients must then use the new password.
+- The portal also provides a factory-reset button with an explicit browser
+  confirmation.
+- Holding BOOT continuously for six seconds performs the same credential
+  factory reset as soon as the threshold is reached. Button transitions are
+  accepted only after remaining stable for 150 milliseconds to reject contact
+  bounce. The saved password is removed and ComNetAR becomes an open network.
+
+Password changes do not restart the central module or trigger the node-wide
+reset manager.

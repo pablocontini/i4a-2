@@ -61,7 +61,8 @@ void ap_print_info(AccessPointPtr ap) {
   ESP_LOGI(LOGGING_TAG, "wifi_config.ap.authmode: %d", ap->wifi_config.ap.authmode);
   ESP_LOGI(LOGGING_TAG, "wifi_config.ap.ssid: %s", ap->wifi_config.ap.ssid);
   ESP_LOGI(LOGGING_TAG, "wifi_config.ap.ssid_len: %d", ap->wifi_config.ap.ssid_len);
-  ESP_LOGI(LOGGING_TAG, "wifi_config.ap.password: %s", ap->wifi_config.ap.password);
+  ESP_LOGI(LOGGING_TAG, "wifi_config.ap.password: %s",
+           strlen((const char *)ap->wifi_config.ap.password) > 0 ? "[configured]" : "[open]");
 }
 
 void ap_set_channel(AccessPointPtr ap, uint8_t channel) {
@@ -76,7 +77,14 @@ void ap_set_ssid(AccessPointPtr ap, const char *ssid) {
 };
 
 void ap_set_password(AccessPointPtr ap, const char *password){
-  strcpy((char *)ap->wifi_config.ap.password, password);
+  memset(ap->wifi_config.ap.password, 0, sizeof(ap->wifi_config.ap.password));
+  snprintf((char *)ap->wifi_config.ap.password,
+           sizeof(ap->wifi_config.ap.password), "%s", password);
+  memset(ap->password, 0, sizeof(ap->password));
+  snprintf(ap->password, sizeof(ap->password), "%s", password);
+  ap->wifi_config.ap.authmode = strlen(password) == 0
+      ? WIFI_AUTH_OPEN
+      : WIFI_AUTH_WPA2_PSK;
 };
 
 void ap_update(AccessPointPtr ap) {

@@ -48,6 +48,11 @@ esp_err_t device_wifi_init() {
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
+  // Application credentials are persisted explicitly by wifi_credentials.
+  // Keep driver configuration in RAM so AP/STA role changes do not overwrite
+  // the authoritative ComNetAR setting in NVS.
+  ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
   return ESP_OK;
 }
 

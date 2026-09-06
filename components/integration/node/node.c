@@ -10,6 +10,8 @@
 #include "info_manager/info_manager.h"
 #include "traffic.h"
 #include "remote_control.h"
+#include "config_portal/config_portal.h"
+#include "wifi_credentials/wifi_credentials.h"
 #include "node.h"
 
 #define MAX_DEVICES_PER_HOUSE 5
@@ -21,7 +23,6 @@
 #define NAT_NETWORK_PASSWORD "I4A123456"
 
 #define HOUSE_NETWORK_NAME "ComNetAR"
-#define HOUSE_NETWORK_PASSWORD ""
 
 #define CALIBRATION_DELAY_SECONDS 2
 #define AP_STA_DELAY_SECONDS 1
@@ -67,6 +68,22 @@ static node_device_orientation_t node_get_config_orientation(void){
   }
 }
 
+static esp_err_t node_apply_house_ap_password(const char *password, void *context) {
+  DevicePtr device_ptr = (DevicePtr)context;
+
+  if (password == NULL || device_ptr == NULL || device_ptr->mode != AP ||
+      device_ptr->state != d_active || device_ptr->access_point_ptr == NULL ||
+      !ap_is_initialized(device_ptr->access_point_ptr)) {
+    ESP_LOGE(TAG, "Cannot apply ComNetAR password: AP is not active");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  ap_set_password(device_ptr->access_point_ptr, password);
+  ap_update(device_ptr->access_point_ptr);
+  ESP_LOGI(TAG, "ComNetAR AP credentials applied without restarting the node");
+  return ESP_OK;
+}
+
 void node_setup(void){
   ESP_ERROR_CHECK(node_init_event_queues());
   ESP_ERROR_CHECK(node_start_event_tasks());
@@ -82,6 +99,7 @@ void node_setup(void){
   vTaskDelay(pdMS_TO_TICKS(node_ptr->node_device_orientation * CALIBRATION_DELAY_SECONDS * 1000));
 
   ESP_ERROR_CHECK(device_wifi_init());
+  ESP_ERROR_CHECK(wifi_credentials_init());
   ESP_ERROR_CHECK(ring_link_init());
 
   if(node_ptr->node_device_orientation == NODE_DEVICE_ORIENTATION_CENTER) {
@@ -112,6 +130,12 @@ void node_setup(void){
   node_ptr->node_device_is_apsta = false;
   node_traffic_init();
   im_scheduler_start();
+
+  if (node_ptr->node_device_orientation == NODE_DEVICE_ORIENTATION_CENTER &&
+      !node_ptr->node_device_is_center_root) {
+    ESP_ERROR_CHECK(config_portal_init(node_apply_house_ap_password,
+                                       node_ptr->node_device_ptr));
+  }
 }
 
 void node_set_as_sta(){
@@ -142,8 +166,8 @@ void node_set_as_ap(uint32_t network, uint32_t mask){
   uint32_t node_gateway;
   uint8_t ap_channel_to_emit = cm_get_suggested_channel();
   uint8_t ap_max_sta_connections;
-  char *wifi_network_prefix;
-  char *wifi_network_password;
+  const char *wifi_network_prefix;
+  const char *wifi_network_password;
 
   if (node_ptr->node_device_orientation == NODE_DEVICE_ORIENTATION_CENTER) {
     if(node_ptr->node_device_is_center_root) {
@@ -156,7 +180,7 @@ void node_set_as_ap(uint32_t network, uint32_t mask){
     } else {
       node_gateway = network + 1;
       wifi_network_prefix = HOUSE_NETWORK_NAME;
-      wifi_network_password = HOUSE_NETWORK_PASSWORD;
+      wifi_network_password = wifi_credentials_get_house_password();
       ap_max_sta_connections = MAX_DEVICES_PER_HOUSE;
     }
   } else {

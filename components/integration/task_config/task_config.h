@@ -46,6 +46,13 @@
 #define TASK_REMOTE_CONTROL_STACK     4096
 #define TASK_REMOTE_CONTROL_PRIORITY  LOW_PRIORITY
 
+// ComNetAR configuration portal tasks
+
+#define TASK_CONFIG_PORTAL_CORE           1
+#define TASK_CONFIG_PORTAL_STACK          4096
+#define TASK_CONFIG_PORTAL_APPLY_STACK    2048
+#define TASK_CONFIG_PORTAL_PRIORITY       LOW_PRIORITY
+
 // Callbacks tasks
 
 #define TASK_CALLBACK_CORE          0
