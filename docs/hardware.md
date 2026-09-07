@@ -198,3 +198,48 @@ Both areas currently use plain HTTP, so credentials are not encrypted in
 transit. Production deployments should add HTTPS and NVS encryption if
 attackers on the local network or with physical flash access are part of the
 threat model.
+
+### 5.3 Antenna orientation mode
+
+The central ESP32 samples GPIO33 during startup. The board provides an external
+pull-up and the DIP switch connects the pin to GND, so both internal pulls stay
+disabled. GPIO33 high selects normal operation; GPIO33 low selects antenna
+orientation mode for the complete five-ESP node. The committed software-force
+macro, `AOM_FORCE_ORIENTATION_MODE`, remains set to `0`.
+
+In orientation mode, normal routing, AP/STA roles, root connection, traffic
+monitoring, the information scheduler, and the ComNetAR configuration portal
+do not start. The central module periodically broadcasts `AOM_MSG_START` over
+`ring_share`. Each directional ESP32 then scans every second for SSIDs beginning
+with `I4A` and reports SSID, RSSI, and channel. The central prints the resulting
+table every five seconds.
+
+The central also creates this local captive portal:
+
+- SSID: `Orientacion_Antenas`
+- Password: `12345678`
+- Address and gateway: `192.168.50.1`
+- Netmask: `255.255.255.0`
+- HTTP: TCP port 80
+- Captive DNS: UDP port 53
+
+The page at `http://192.168.50.1/` refreshes its data from
+`http://192.168.50.1/api/reports` every five seconds. Useful checks from
+PowerShell are:
+
+```powershell
+ipconfig
+ping 192.168.50.1
+curl.exe -v http://192.168.50.1/
+curl.exe -v http://192.168.50.1/api/reports
+```
+
+If the client receives an address in `192.168.50.0/24` but ping or HTTP is
+unreliable, temporarily disable Tailscale or another active VPN and retry:
+
+```powershell
+tailscale down
+```
+
+With GPIO33 high, `Orientacion_Antenas` and the AOM HTTP/DNS tasks must not
+appear; the existing normal routing and root-link flow remains unchanged.

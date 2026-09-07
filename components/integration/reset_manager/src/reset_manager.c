@@ -10,6 +10,8 @@
 #include "traffic.h"
 #include "reset_manager/reset_manager.h"
 
+void node_set_orientation_mode_requested(bool enabled);
+
 #define ROOT_UUID "000000000000"
 
 static const char *TAG = "reset_manager";
@@ -250,7 +252,12 @@ static void rm_on_sibling_message(void *ctx, const uint8_t *msg, uint16_t len) {
                 strncpy(rm->uuid, startup->uuid, UUID_LENGTH);
                 rm->uuid[UUID_LENGTH - 1] = '\0';
                 rm->is_root = startup->is_root;
-                ESP_LOGI(TAG, "Startup message received: UUID=%s, is_root=%d", rm->uuid, rm->is_root);
+                node_set_orientation_mode_requested(
+                    startup->orientation_mode != 0);
+                ESP_LOGI(TAG,
+                         "Startup message received: UUID=%s, is_root=%d, orientation_mode=%d",
+                         rm->uuid, rm->is_root,
+                         startup->orientation_mode);
 
                 rm->is_up = true;
             }
@@ -506,7 +513,7 @@ uint8_t rm_get_local_antenna_power(void) {
     return local_power_config[orientation];
 }
 
-bool rm_broadcast_startup_info(bool is_root) {
+bool rm_broadcast_startup_info(bool is_root, bool orientation_mode) {
     if (!rm->rs) {
         ESP_LOGW(TAG, "STARTUP broadcast skipped: manager not initialized");
         return false;
@@ -522,13 +529,17 @@ bool rm_broadcast_startup_info(bool is_root) {
     }
     
     strncpy(packet.uuid, rm->uuid, sizeof(packet.uuid));
+    packet.uuid[sizeof(packet.uuid) - 1] = '\0';
     packet.is_root = is_root ? 1 : 0;
+    packet.orientation_mode = orientation_mode ? 1 : 0;
     rm->is_root = is_root;
 
     bool broadcast = rs_broadcast(rm->rs, RS_RESET_MANAGER, (uint8_t *)&packet, sizeof(packet));
 
     if(broadcast) {
-        ESP_LOGI(TAG, "Startup message broadcasted: UUID=%s, is_root=%d", rm->uuid, rm->is_root);
+        ESP_LOGI(TAG,
+                 "Startup message broadcasted: UUID=%s, is_root=%d, orientation_mode=%d",
+                 rm->uuid, rm->is_root, packet.orientation_mode);
         rm->is_up = true;
     }
 

@@ -14,6 +14,8 @@
 #include "wifi_credentials/wifi_credentials.h"
 #include "node.h"
 
+bool antenna_orientation_mode_pin_is_active(void);
+
 #define MAX_DEVICES_PER_HOUSE 5
 
 #define NODE_NAME_PREFIX "I4A"
@@ -34,6 +36,7 @@
 #define DEFAULT_MASK 0xFFFFFFFF
 
 static const char *TAG = "node";
+static bool s_orientation_mode_requested = false;
 
 typedef struct node {
   DevicePtr node_device_ptr;
@@ -58,6 +61,14 @@ static Device node_device = {
 };
 
 static node_t *node_ptr = &node;
+
+void node_set_orientation_mode_requested(bool enabled) {
+  s_orientation_mode_requested = enabled;
+}
+
+bool node_is_orientation_mode_enabled(void) {
+  return s_orientation_mode_requested;
+}
 
 static node_device_orientation_t node_get_config_orientation(void){
   config_id_t config_bits = config_get_id();
@@ -116,13 +127,17 @@ void node_setup(void){
   ESP_ERROR_CHECK(ring_link_init());
 
   if(node_ptr->node_device_orientation == NODE_DEVICE_ORIENTATION_CENTER) {
+    bool orientation_mode = antenna_orientation_mode_pin_is_active();
+    node_set_orientation_mode_requested(orientation_mode);
+
     while (!rm_broadcast_reset()) {
       vTaskDelay(pdMS_TO_TICKS(100));
     }
 
     vTaskDelay(pdMS_TO_TICKS(10000)); // Wait 10 seconds so all the devices come back up in case this was an actual node reset
 
-    while (!rm_broadcast_startup_info(config_mode_is(CONFIG_MODE_ROOT))) {
+    while (!rm_broadcast_startup_info(config_mode_is(CONFIG_MODE_ROOT),
+                                      orientation_mode)) {
       vTaskDelay(pdMS_TO_TICKS(100));
     }
 
@@ -141,14 +156,19 @@ void node_setup(void){
   node_ptr->node_device_uuid = rm_get_uuid();
   node_ptr->node_device_is_center_root = rm_is_root();
   node_ptr->node_device_is_apsta = false;
-  node_traffic_init();
-  im_scheduler_start();
+  if (!node_is_orientation_mode_enabled()) {
+    node_traffic_init();
+    im_scheduler_start();
 
-  if (node_ptr->node_device_orientation == NODE_DEVICE_ORIENTATION_CENTER &&
-      !node_ptr->node_device_is_center_root) {
-    ESP_ERROR_CHECK(config_portal_init(node_apply_house_ap_password,
-                                       node_schedule_antenna_power_update,
-                                       node_ptr->node_device_ptr));
+    if (node_ptr->node_device_orientation == NODE_DEVICE_ORIENTATION_CENTER &&
+        !node_ptr->node_device_is_center_root) {
+      ESP_ERROR_CHECK(config_portal_init(node_apply_house_ap_password,
+                                         node_schedule_antenna_power_update,
+                                         node_ptr->node_device_ptr));
+    }
+  } else {
+    ESP_LOGI(TAG,
+             "Orientation mode active: skipping normal traffic, scheduler and configuration portal");
   }
 }
 

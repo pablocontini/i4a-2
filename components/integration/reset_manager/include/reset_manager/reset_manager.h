@@ -16,6 +16,7 @@ typedef struct {
     uint8_t opcode;
     char uuid[UUID_LENGTH];
     uint8_t is_root;
+    uint8_t orientation_mode;
 } rm_startup_packet_t;
 
 typedef struct reset_manager {
@@ -33,7 +34,7 @@ void rm_init(ring_share_t *rs);
 esp_err_t rm_power_storage_init(void);
 
 bool rm_broadcast_reset(void);
-bool rm_broadcast_startup_info(bool is_root);
+bool rm_broadcast_startup_info(bool is_root, bool orientation_mode);
 
 /**
  * Asynchronously distribute four directional powers from the central module.

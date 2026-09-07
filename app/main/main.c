@@ -14,6 +14,7 @@
 #include "callbacks.h"
 #include "task_config.h"
 #include "info_manager/info_manager.h"
+#include "antenna_orientation_mode/antenna_orientation_mode.h"
 #include "node.h"
 
 #define ROOT_NETWORK 0x0A000000  // 10.0.0.0
@@ -21,14 +22,23 @@
 
 #define ROUTING_ORIENTATION_OFFSET 1
 
-static const char *TAG = "main";
-
 static sync_t _sync = { 0 };
 static shared_state_t ss = { 0 };
 
 struct netif *custom_ip4_route_src_hook(const ip4_addr_t *src, const ip4_addr_t *dest) {
+    /*
+     * En modo orientación no se inicializa el routing normal.
+     * El ESP central crea un AP local para el portal.
+     * Para que HTTP/TCP funcione correctamente, dejamos que lwIP use
+     * su ruteo estándar.
+     */
+    if (node_is_orientation_mode_enabled()) {
+        return NULL;
+    }
+
     uint32_t src_ip = lwip_ntohl(ip4_addr_get_u32(src));
     uint32_t dst_ip = lwip_ntohl(ip4_addr_get_u32(dest));
+
     return node_do_routing(src_ip, dst_ip);
 }
 
@@ -44,8 +54,15 @@ void routing_task(void *pvParameters) {
 void app_main(void) {
     node_setup();
 
-    wireless_t *wl = node_get_wireless_instance();
     ring_share_t *rs = node_get_rs_instance();
+
+    if (node_is_orientation_mode_enabled()) {
+        printf("main: modo orientacion activo\n");
+        antenna_orientation_mode_run(rs);
+        return;
+    }
+
+    wireless_t *wl = node_get_wireless_instance();
     routing_t *rt = node_get_rt_instance();
     node_device_orientation_t orientation = node_get_device_orientation();
     bool is_center_root = node_is_device_center_root();

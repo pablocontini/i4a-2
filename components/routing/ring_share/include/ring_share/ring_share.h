@@ -22,6 +22,7 @@ typedef enum component_id {
     RS_RESET_MANAGER = 4,
     RS_INFO_MANAGER = 5,
     RS_PRIORITY_MANAGER = 6,
+    RS_ANTENNA_ORIENTATION_MODE = 7,
 
     /* Keep this variant last */
     RS_LAST_COMPONENT_ID,
