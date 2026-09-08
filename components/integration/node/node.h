@@ -22,6 +22,8 @@ typedef enum {
 void node_setup(void); // Always call this before doing anything with this module
 void node_set_orientation_mode_requested(bool enabled);
 bool node_is_orientation_mode_enabled(void);
+void node_set_configuration_mode_requested(bool enabled);
+bool node_is_configuration_mode_enabled(void);
 
 // Device mode setting
 void node_set_as_ap(uint32_t network, uint32_t mask); // Sets device as AP with desired subnet/mask

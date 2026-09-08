@@ -31,6 +31,7 @@ struct Station {
   bool ap_found;
   bool is_fully_connected;
   bool is_apsta;
+  int8_t rssi_threshold_dbm;
   Station_State state;
   wifi_config_t wifi_config;
   wifi_ap_record_t wifi_ap_found;
@@ -55,6 +56,8 @@ void station_find_ap(StationPtr stationPtr);
 bool station_found_ap(StationPtr station_ptr);
 void transform_wifi_ap_record_to_config(StationPtr stationPtr);
 int8_t station_scan_best_rssi(StationPtr stationPtr);
+void station_set_rssi_threshold(StationPtr stationPtr,
+                                int8_t rssi_threshold_dbm);
 
 /*
  * @brief Discover the AP with the name like 'ESP_' and return the AP

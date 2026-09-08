@@ -15,6 +15,7 @@ extern "C" {
 
 #define PORTAL_SETTINGS_ANTENNA_COUNT 4
 #define PORTAL_SETTINGS_DEFAULT_POWER_QDBM 80
+#define PORTAL_SETTINGS_DEFAULT_RSSI_THRESHOLD_DBM (-128)
 
 typedef enum {
     PORTAL_ANTENNA_NORTH = 0,
@@ -33,7 +34,16 @@ typedef struct {
     uint8_t quarter_dbm[PORTAL_SETTINGS_ANTENNA_COUNT];
 } portal_antenna_power_config_t;
 
-/** Load the administrator verifier and antenna powers from NVS. */
+/**
+ * Minimum received signal level accepted by each directional station. An AP
+ * whose RSSI is below the corresponding value is ignored. Values are dBm;
+ * -128 disables the practical cutoff and preserves the original behaviour.
+ */
+typedef struct {
+    int8_t dbm[PORTAL_SETTINGS_ANTENNA_COUNT];
+} portal_antenna_rssi_config_t;
+
+/** Load the administrator verifier and antenna settings from NVS. */
 esp_err_t portal_settings_init(void);
 
 /** Validate an administrator password before hashing or persisting it. */
@@ -57,6 +67,16 @@ portal_antenna_power_config_t portal_settings_get_antenna_powers(void);
 /** Atomically persist all four directional antenna powers in NVS. */
 esp_err_t portal_settings_set_antenna_powers(
     const portal_antenna_power_config_t *config);
+
+/** Validate an RSSI threshold expressed in dBm. */
+bool portal_settings_is_valid_rssi_threshold(int rssi_dbm);
+
+/** Return a copy of the four persisted RSSI thresholds. */
+portal_antenna_rssi_config_t portal_settings_get_antenna_rssi_thresholds(void);
+
+/** Atomically persist all four directional RSSI thresholds in NVS. */
+esp_err_t portal_settings_set_antenna_rssi_thresholds(
+    const portal_antenna_rssi_config_t *config);
 
 #ifdef __cplusplus
 }

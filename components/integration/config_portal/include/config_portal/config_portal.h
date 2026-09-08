@@ -1,8 +1,7 @@
 #ifndef CONFIG_PORTAL_H
 #define CONFIG_PORTAL_H
 
-#include <stddef.h>
-#include <stdint.h>
+#include <stdbool.h>
 
 #include "esp_err.h"
 
@@ -10,26 +9,23 @@
 extern "C" {
 #endif
 
-typedef esp_err_t (*config_portal_apply_password_cb_t)(const char *password,
-                                                       void *context);
-typedef esp_err_t (*config_portal_apply_powers_cb_t)(
-    const uint8_t *power_qdbm, size_t count, void *context);
+typedef enum {
+    CONFIG_PORTAL_BOOT_MODE_NORMAL = 0,
+    CONFIG_PORTAL_BOOT_MODE_CONFIGURATION,
+    CONFIG_PORTAL_BOOT_MODE_ORIENTATION,
+} config_portal_boot_mode_t;
 
 /**
- * Configure the central module BOOT button and start its monitor task.
- * A debounced short press enables two HTTP areas for five minutes: the root
- * page lets the final user change only the ComNetAR Wi-Fi credentials, while
- * /admin requires administrator authentication and manages only the stored
- * directional antenna powers and administrator password. Holding BOOT for
- * six seconds restores only the ComNetAR Wi-Fi credentials; it does not reset
- * the administrator verifier or stored directional antenna powers.
- * One callback applies a saved credential to the running ComNetAR AP without
- * restarting the node. The other schedules distribution of the already saved
- * directional antenna powers and a coordinated node restart.
+ * Consume the one-shot mode request left in RTC memory before a coordinated
+ * restart. This is called only by the central module during startup.
  */
-esp_err_t config_portal_init(config_portal_apply_password_cb_t apply_password,
-                             config_portal_apply_powers_cb_t apply_powers,
-                             void *context);
+config_portal_boot_mode_t config_portal_take_boot_mode_request(void);
+
+/** Monitor BOOT during normal operation and restart into configuration mode. */
+esp_err_t config_portal_start_button_monitor(void);
+
+/** Start the dedicated configuration AP and web portal for five minutes. */
+esp_err_t config_portal_run(void);
 
 #ifdef __cplusplus
 }

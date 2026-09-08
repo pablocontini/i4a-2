@@ -138,81 +138,79 @@ GPIO 5  (CS)    ────► GPIO 15 (CS)
 - Programming: Via USB interface
 - Booting: Custom handling via FreeRTOS
 
-### 5.2 Temporary ComNetAR portals
+### 5.2 Dedicated ComNetAR configuration mode
 
-The BOOT button (GPIO0) on the central, non-root module controls one temporary
-HTTP server with separate user and administrator areas. A short press enables
-both areas for five minutes. The exact gateway address is printed when the
-server starts if firmware logs are enabled.
+GPIO0 (BOOT) is the only production hardware control used to select a special
+mode on the central module. GPIO33 is not required because the production
+boards do not include its DIP switch.
 
-The final-user area is available at the gateway root, for example
-`http://10.x.x.1/`:
+During normal operation, a debounced short BOOT press stores a one-shot marker
+in RTC memory and performs a coordinated restart of all five ESP32 modules. The
+next startup consumes that marker and selects a separate configuration mode.
+Normal routing, root connection, traffic monitoring, and information tasks do
+not start in this mode. The central creates this temporary network:
 
-- It does not request the administrator password and does not expose a link to
-  the administrator area.
-- It lets a connected user replace the ComNetAR Wi-Fi password with a valid
-  8-to-63-character value. The password is persisted in NVS and applied only to
-  the running ComNetAR access point; connected clients must then reconnect.
-- It retains the existing Wi-Fi reset action, with an explicit browser
-  confirmation. This removes only the ComNetAR Wi-Fi password and leaves the
-  network open.
-- Both user actions require the random CSRF token generated when the temporary
-  server starts.
+- SSID: `ComNetAR_Config`
+- Security: open network, without a password
+- Address and gateway: `192.168.4.1`
+- Netmask: `255.255.255.0`
+- HTTP: TCP port 80
 
-The developer-only area is available by opening `/admin` directly, for example
-`http://10.x.x.1/admin`:
+Open `http://192.168.4.1/` after connecting. The final-user area changes or
+removes the ComNetAR Wi-Fi password. Saving either operation schedules a
+coordinated restart back into normal mode.
 
-- It requires its own administrator password. On the first boot after
-  provisioning or erasing NVS, the initial password is `i4a12345`. The page
-  warns while this initial credential remains active and lets an authenticated
-  administrator replace it remotely. A successful replacement invalidates the
-  current session.
-- It does not display or provide an endpoint for changing or resetting the
-  ComNetAR Wi-Fi password.
-- The administrator password is not stored as plaintext. NVS contains a random
-  salt and a PBKDF2-SHA256 verifier. Five failed logins block new attempts for
-  30 seconds. Successful logins use a random, HTTP-only session cookie scoped
-  to `/admin` and a CSRF token; both expire when the server closes or after five
-  minutes.
-- Four independent maximum transmit powers can be stored for the North, South,
-  East, and West radios. The selectable levels match the ESP-IDF v5.1.2 power
-  mapping and default to 20 dBm. The central hotspot has no stored power field.
-  Saving only updates the desired values in the central module's NVS. A
-  separate confirmation action distributes the complete configuration through
-  the reset-manager ring protocol. Each directional module stores the values
-  in its own NVS and acknowledges the transaction. Only after North, South,
-  East, and West have all acknowledged does the central module broadcast the
-  existing node reset and restart itself. Each directional radio applies its
-  own stored value during the next boot; the central ComNetAR hotspot remains
-  fixed at the existing 20 dBm setting. A failed acknowledgement or a 20-second
-  timeout cancels the coordinated reset so the administrator can retry.
+The developer-only area is available at `http://192.168.4.1/admin`:
 
-Holding BOOT continuously for six seconds resets only the ComNetAR Wi-Fi
-credentials as soon as the threshold is reached. Button transitions are
-accepted only after remaining stable for 150 milliseconds to reject contact
-bounce. Administrative settings remain unchanged. Password changes do not
-restart the central module or trigger the node-wide reset manager; only the
-explicit antenna-power apply action does.
+- Its initial password after provisioning or erasing NVS is `i4a12345`.
+- The password is represented in NVS by a random salt and a PBKDF2-SHA256
+  verifier, not plaintext. Five failed logins block attempts for 30 seconds.
+- It stores four independent maximum transmit powers for North, South, East,
+  and West. The values use the ESP-IDF quarter-dBm mapping and default to
+  20 dBm.
+- It separately stores four minimum RSSI thresholds in dBm. A directional ESP
+  ignores candidate networks below its configured threshold. `-128 dBm`
+  preserves the original behaviour and accepts every representable level.
+- `Aplicar configuracion y reiniciar nodo` exits the portal and performs a
+  coordinated restart. The central sends all four transmit powers and all four
+  RSSI thresholds in the normal startup broadcast. Each directional module
+  selects its own value by orientation before starting Wi-Fi.
+- `Iniciar modo orientacion` stores a one-shot request in RTC memory and
+  performs a coordinated restart. On the next startup, the central distributes
+  orientation mode to the four directional modules.
 
-Both areas currently use plain HTTP, so credentials are not encrypted in
-transit. Production deployments should add HTTPS and NVS encryption if
-attackers on the local network or with physical flash access are part of the
-threat model.
+A short BOOT press while the portal is active exits configuration mode without
+discarding settings that were already saved. The same restart occurs
+automatically after five minutes. Holding BOOT for six seconds resets only the
+ComNetAR Wi-Fi password; the restart waits until BOOT is released so GPIO0 is
+not sampled low by the ROM bootloader. Administrative and antenna settings are
+preserved.
+
+The configuration portal uses plain HTTP, so credentials are not encrypted in
+transit. Its separate AP, physical activation, administrator authentication,
+five-minute timeout, session cookie, and CSRF validation reduce exposure but do
+not replace HTTPS or NVS encryption where those protections are required.
 
 ### 5.3 Antenna orientation mode
 
-The central ESP32 samples GPIO33 during startup. The board provides an external
-pull-up and the DIP switch connects the pin to GND, so both internal pulls stay
-disabled. GPIO33 high selects normal operation; GPIO33 low selects antenna
-orientation mode for the complete five-ESP node. The committed software-force
-macro, `AOM_FORCE_ORIENTATION_MODE`, remains set to `0`.
+Orientation mode is selected from the authenticated configuration portal. Its
+request is temporary: the RTC marker is consumed on the next startup and is not
+stored in NVS. Consequently, a later reset or power cycle returns to normal
+operation unless orientation is explicitly requested again.
+
+The production defaults keep both `AOM_ENABLE_GPIO33_SELECTION` and
+`AOM_FORCE_ORIENTATION_MODE` set to `0`, so GPIO33 is not configured or sampled
+and cannot float into orientation mode. `AOM_ENABLE_GPIO33_SELECTION` can be set
+to `1` only in a special firmware build for the prototype board with the
+external pull-up and active-low DIP switch.
 
 In orientation mode, normal routing, AP/STA roles, root connection, traffic
 monitoring, the information scheduler, and the ComNetAR configuration portal
 do not start. The central module periodically broadcasts `AOM_MSG_START` over
 `ring_share`. Each directional ESP32 then scans every second for SSIDs beginning
 with `I4A` and reports SSID, RSSI, and channel. The central prints the resulting
-table every five seconds.
+table every five seconds. The normal transmit-power and minimum-RSSI settings
+remain stored but are intentionally not applied to these orientation scans.
 
 The central also creates this local captive portal:
 
@@ -241,5 +239,8 @@ unreliable, temporarily disable Tailscale or another active VPN and retry:
 tailscale down
 ```
 
-With GPIO33 high, `Orientacion_Antenas` and the AOM HTTP/DNS tasks must not
-appear; the existing normal routing and root-link flow remains unchanged.
+Use `Finalizar orientacion y reiniciar normalmente` on the orientation portal
+to broadcast a coordinated reset. Because the one-shot request was already
+consumed, all five ESP32 modules then start in normal mode. When orientation was
+not requested, `Orientacion_Antenas` and the AOM HTTP/DNS tasks must not appear;
+the existing normal routing and root-link flow remains unchanged.

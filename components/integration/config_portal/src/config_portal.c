@@ -6,16 +6,23 @@
 #include <string.h>
 
 #include "driver/gpio.h"
+#include "esp_attr.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_random.h"
+#include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "lwip/ip4_addr.h"
+#include "lwip/ip_addr.h"
+#include "dhcpserver/dhcpserver.h"
 
 #include "config_portal/config_portal.h"
 #include "portal_settings/portal_settings.h"
+#include "reset_manager/reset_manager.h"
 #include "task_config.h"
 #include "wifi_credentials/wifi_credentials.h"
 
@@ -26,7 +33,15 @@
 #define FACTORY_RESET_HOLD_MS 6000
 #define PORTAL_TIMEOUT_MS (5 * 60 * 1000)
 #define SESSION_TIMEOUT_MS PORTAL_TIMEOUT_MS
-#define PASSWORD_APPLY_DELAY_MS 1500
+#define RESTART_DELAY_MS 1500
+#define RESET_BROADCAST_WAIT_MS 2500
+
+#define CONFIG_PORTAL_BOOT_CONFIGURATION_MAGIC UINT32_C(0x43464743)
+#define CONFIG_PORTAL_BOOT_ORIENTATION_MAGIC UINT32_C(0x4346474F)
+#define CONFIG_PORTAL_AP_SSID "ComNetAR_Config"
+#define CONFIG_PORTAL_AP_CHANNEL 1
+#define CONFIG_PORTAL_AP_MAX_CONNECTIONS 4
+#define CONFIG_PORTAL_IP "192.168.4.1"
 
 #define LOGIN_MAX_FAILED_ATTEMPTS 5
 #define LOGIN_LOCKOUT_MS 30000
@@ -37,7 +52,7 @@
 #define SESSION_TOKEN_HEX_LENGTH (SESSION_TOKEN_BYTES * 2)
 #define POWER_OPTIONS_HTML_LENGTH 768
 #define USER_PORTAL_PAGE_HTML_LENGTH 5000
-#define PORTAL_PAGE_HTML_LENGTH 10000
+#define PORTAL_PAGE_HTML_LENGTH 12000
 
 #define SESSION_COOKIE_NAME "i4a_session"
 
@@ -45,11 +60,14 @@ static const char *TAG = "config_portal";
 
 static httpd_handle_t portal_server = NULL;
 static TaskHandle_t button_task_handle = NULL;
+static esp_netif_t *portal_netif = NULL;
 static int64_t portal_started_at_us = 0;
-static volatile bool password_apply_pending = false;
-static config_portal_apply_password_cb_t apply_password_callback = NULL;
-static config_portal_apply_powers_cb_t apply_powers_callback = NULL;
-static void *portal_callback_context = NULL;
+static volatile bool restart_pending = false;
+static bool portal_mode_active = false;
+
+RTC_NOINIT_ATTR static uint32_t config_portal_next_boot_marker;
+
+static void config_portal_stop(void);
 
 static char session_token[SESSION_TOKEN_HEX_LENGTH + 1] = {0};
 static char csrf_token[SESSION_TOKEN_HEX_LENGTH + 1] = {0};
@@ -176,7 +194,7 @@ static const char ADMIN_PORTAL_HTML_TEMPLATE[] =
     "<p>Esta seccion esta reservada para administrar las antenas y el acceso administrativo.</p>"
     "%s"
     "<h2>Potencia de antenas direccionales</h2>"
-    "<p>Guardar solo actualiza la configuracion deseada. Para distribuirla y reiniciar el nodo use el boton de aplicacion.</p>"
+    "<p>Limita la potencia de transmision durante el funcionamiento normal.</p>"
     "<form method=\"post\" action=\"/admin/antenna-power\">"
     "<input type=\"hidden\" name=\"csrf\" value=\"%s\">"
     "<div class=\"grid\">"
@@ -185,9 +203,24 @@ static const char ADMIN_PORTAL_HTML_TEMPLATE[] =
     "<label for=\"power_east\">Este<select id=\"power_east\" name=\"power_east\">%s</select></label>"
     "<label for=\"power_west\">Oeste<select id=\"power_west\" name=\"power_west\">%s</select></label>"
     "</div><button type=\"submit\">Guardar potencias</button></form>"
-    "<form method=\"post\" action=\"/admin/apply-powers\" onsubmit=\"return confirm('Se reiniciaran los cinco ESP32. Desea continuar?')\">"
+    "<hr><h2>Limite minimo de RSSI</h2>"
+    "<p>Una red con una senal inferior al limite configurado se ignora. Use -128 dBm para aceptar cualquier nivel.</p>"
+    "<form method=\"post\" action=\"/admin/antenna-rssi\">"
     "<input type=\"hidden\" name=\"csrf\" value=\"%s\">"
-    "<button class=\"restart\" type=\"submit\">Aplicar potencias y reiniciar nodo</button></form>"
+    "<div class=\"grid\">"
+    "<label for=\"rssi_north\">Norte (dBm)<input id=\"rssi_north\" name=\"rssi_north\" type=\"number\" min=\"-128\" max=\"-1\" value=\"%d\" required></label>"
+    "<label for=\"rssi_south\">Sur (dBm)<input id=\"rssi_south\" name=\"rssi_south\" type=\"number\" min=\"-128\" max=\"-1\" value=\"%d\" required></label>"
+    "<label for=\"rssi_east\">Este (dBm)<input id=\"rssi_east\" name=\"rssi_east\" type=\"number\" min=\"-128\" max=\"-1\" value=\"%d\" required></label>"
+    "<label for=\"rssi_west\">Oeste (dBm)<input id=\"rssi_west\" name=\"rssi_west\" type=\"number\" min=\"-128\" max=\"-1\" value=\"%d\" required></label>"
+    "</div><button type=\"submit\">Guardar limites RSSI</button></form>"
+    "<form method=\"post\" action=\"/admin/apply-settings\" onsubmit=\"return confirm('Se reiniciaran los cinco ESP32. Desea continuar?')\">"
+    "<input type=\"hidden\" name=\"csrf\" value=\"%s\">"
+    "<button class=\"restart\" type=\"submit\">Aplicar configuracion y reiniciar nodo</button></form>"
+    "<hr><h2>Orientacion de antenas</h2>"
+    "<p>Reinicia los cinco ESP32 en el modo especial de medicion RSSI. No se inicia el ruteo normal.</p>"
+    "<form method=\"post\" action=\"/admin/orientation-mode\" onsubmit=\"return confirm('Reiniciar los cinco ESP32 en modo orientacion?')\">"
+    "<input type=\"hidden\" name=\"csrf\" value=\"%s\">"
+    "<button class=\"restart\" type=\"submit\">Iniciar modo orientacion</button></form>"
     "<hr><h2>Contrasena administrativa</h2>"
     "<p>Al cambiarla se cerrara la sesion actual.</p>"
     "<form method=\"post\" action=\"/admin/password\">"
@@ -214,7 +247,7 @@ static const char WIFI_SUCCESS_HTML[] =
     "<title>ComNetAR</title><style>body{font-family:system-ui;background:#eef3f8;color:#17212b;display:grid;place-items:center;min-height:100vh;margin:0}"
     "main{width:min(88vw,420px);background:white;padding:28px;border-radius:18px;box-shadow:0 14px 40px #17324d24}h1{color:#166534}</style>"
     "</head><body><main><h1>Contrasena Wi-Fi guardada</h1>"
-    "<p>El punto de acceso se actualizara. Vuelva a conectarse usando la nueva contrasena.</p>"
+    "<p>El nodo se reiniciara en modo normal. Vuelva a conectarse usando la nueva contrasena.</p>"
     "</main></body></html>";
 
 static const char POWER_SUCCESS_HTML[] =
@@ -222,16 +255,31 @@ static const char POWER_SUCCESS_HTML[] =
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<title>ComNetAR</title><style>body{font-family:system-ui;margin:2rem;color:#17212b}a{color:#0369a1}</style>"
     "</head><body><main><h1>Potencias guardadas</h1>"
-    "<p>Los cuatro valores quedaron almacenados en memoria no volatil. Para aplicarlos, vuelva al portal y use Aplicar potencias y reiniciar nodo.</p>"
+    "<p>Los cuatro valores quedaron almacenados en memoria no volatil. Para aplicarlos, vuelva al portal y use Aplicar configuracion y reiniciar nodo.</p>"
     "<p><a href=\"/admin\">Volver al portal administrativo</a></p></main></body></html>";
 
-static const char POWER_APPLY_STARTED_HTML[] =
+static const char RSSI_SUCCESS_HTML[] =
+    "<!doctype html><html lang=\"es\"><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<title>ComNetAR</title><style>body{font-family:system-ui;margin:2rem;color:#17212b}a{color:#0369a1}</style>"
+    "</head><body><main><h1>Limites RSSI guardados</h1>"
+    "<p>Los cuatro limites quedaron almacenados en memoria no volatil. Para aplicarlos, vuelva al portal y use Aplicar configuracion y reiniciar nodo.</p>"
+    "<p><a href=\"/admin\">Volver al portal administrativo</a></p></main></body></html>";
+
+static const char SETTINGS_RESTART_STARTED_HTML[] =
     "<!doctype html><html lang=\"es\"><head><meta charset=\"utf-8\">"
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
     "<title>ComNetAR</title><style>body{font-family:system-ui;margin:2rem;color:#17212b}</style>"
-    "</head><body><main><h1>Distribucion iniciada</h1>"
-    "<p>El nodo se reiniciara cuando las cuatro antenas confirmen que guardaron su potencia.</p>"
-    "<p>Si falta una confirmacion o alguna escritura falla, el reinicio se cancelara y el error quedara registrado.</p>"
+    "</head><body><main><h1>Configuracion guardada</h1>"
+    "<p>El nodo se reiniciara en modo normal y distribuira las potencias y los limites RSSI en el broadcast inicial.</p>"
+    "</main></body></html>";
+
+static const char ORIENTATION_RESTART_STARTED_HTML[] =
+    "<!doctype html><html lang=\"es\"><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<title>ComNetAR</title><style>body{font-family:system-ui;margin:2rem;color:#17212b}</style>"
+    "</head><body><main><h1>Modo orientacion programado</h1>"
+    "<p>Los cinco ESP32 se reiniciaran. Luego conectese a Orientacion_Antenas.</p>"
     "</main></body></html>";
 
 static const char ADMIN_PASSWORD_SUCCESS_HTML[] =
@@ -248,7 +296,7 @@ static const char FACTORY_RESET_SUCCESS_HTML[] =
     "<title>ComNetAR</title><style>body{font-family:system-ui;background:#eef3f8;color:#17212b;display:grid;place-items:center;min-height:100vh;margin:0}"
     "main{width:min(88vw,420px);background:white;padding:28px;border-radius:18px;box-shadow:0 14px 40px #17324d24}h1{color:#166534}</style>"
     "</head><body><main><h1>Red restablecida</h1>"
-    "<p>ComNetAR se actualizara como red abierta. La clave administrativa y las potencias se conservaron.</p>"
+    "<p>El nodo se reiniciara en modo normal con ComNetAR como red abierta. La clave administrativa y los ajustes de antenas se conservaron.</p>"
     "</main></body></html>";
 
 static void secure_zero(void *buffer, size_t length)
@@ -606,6 +654,8 @@ static esp_err_t send_admin_portal_page(httpd_req_t *request)
 {
     portal_antenna_power_config_t powers =
         portal_settings_get_antenna_powers();
+    portal_antenna_rssi_config_t rssi_thresholds =
+        portal_settings_get_antenna_rssi_thresholds();
     char options[PORTAL_SETTINGS_ANTENNA_COUNT]
                 [POWER_OPTIONS_HTML_LENGTH];
 
@@ -637,6 +687,12 @@ static esp_err_t send_admin_portal_page(httpd_req_t *request)
         options[PORTAL_ANTENNA_SOUTH],
         options[PORTAL_ANTENNA_EAST],
         options[PORTAL_ANTENNA_WEST],
+        csrf_token,
+        (int)rssi_thresholds.dbm[PORTAL_ANTENNA_NORTH],
+        (int)rssi_thresholds.dbm[PORTAL_ANTENNA_SOUTH],
+        (int)rssi_thresholds.dbm[PORTAL_ANTENNA_EAST],
+        (int)rssi_thresholds.dbm[PORTAL_ANTENNA_WEST],
+        csrf_token,
         csrf_token,
         csrf_token,
         csrf_token);
@@ -766,42 +822,67 @@ static bool validate_user_form(httpd_req_t *request, char *body,
     return true;
 }
 
-static void delayed_password_apply_task(void *argument)
+static void delayed_node_restart_task(void *argument)
 {
     (void)argument;
-    vTaskDelay(pdMS_TO_TICKS(PASSWORD_APPLY_DELAY_MS));
+    vTaskDelay(pdMS_TO_TICKS(RESTART_DELAY_MS));
 
-    esp_err_t err = apply_password_callback(
-        wifi_credentials_get_house_password(), portal_callback_context);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Unable to apply saved password to AP: %s",
-                 esp_err_to_name(err));
-    } else {
-        ESP_LOGI(TAG, "Saved password applied to running AP");
+    config_portal_stop();
+    bool reset_broadcasted = false;
+    for (size_t attempt = 0; attempt < 20 && !reset_broadcasted; attempt++) {
+        reset_broadcasted = rm_broadcast_reset();
+        if (!reset_broadcasted) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+    if (!reset_broadcasted) {
+        ESP_LOGW(TAG,
+                 "Node reset broadcast failed; central startup will retry synchronization");
     }
 
-    password_apply_pending = false;
-    vTaskDelete(NULL);
+    vTaskDelay(pdMS_TO_TICKS(RESET_BROADCAST_WAIT_MS));
+    esp_restart();
 }
 
-static esp_err_t schedule_password_apply(void)
+static uint32_t boot_marker_for_mode(config_portal_boot_mode_t mode)
 {
-    if (password_apply_pending) {
+    switch (mode) {
+        case CONFIG_PORTAL_BOOT_MODE_NORMAL:
+            return 0;
+        case CONFIG_PORTAL_BOOT_MODE_CONFIGURATION:
+            return CONFIG_PORTAL_BOOT_CONFIGURATION_MAGIC;
+        case CONFIG_PORTAL_BOOT_MODE_ORIENTATION:
+            return CONFIG_PORTAL_BOOT_ORIENTATION_MAGIC;
+        default:
+            return UINT32_MAX;
+    }
+}
+
+static esp_err_t schedule_node_restart(config_portal_boot_mode_t next_mode)
+{
+    if (restart_pending) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    password_apply_pending = true;
+    uint32_t next_boot_marker = boot_marker_for_mode(next_mode);
+    if (next_boot_marker == UINT32_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    config_portal_next_boot_marker = next_boot_marker;
+    restart_pending = true;
     BaseType_t task_created = xTaskCreate(
-        delayed_password_apply_task,
-        "portal_apply",
+        delayed_node_restart_task,
+        "portal_restart",
         TASK_CONFIG_PORTAL_APPLY_STACK,
         NULL,
         TASK_CONFIG_PORTAL_PRIORITY,
         NULL);
 
     if (task_created != pdPASS) {
-        password_apply_pending = false;
-        ESP_LOGE(TAG, "Unable to create delayed password apply task");
+        restart_pending = false;
+        config_portal_next_boot_marker = 0;
+        ESP_LOGE(TAG, "Unable to create delayed node restart task");
         return ESP_ERR_NO_MEM;
     }
 
@@ -816,11 +897,11 @@ static esp_err_t portal_save_handler(httpd_req_t *request)
         return response_result;
     }
 
-    if (password_apply_pending) {
+    if (restart_pending) {
         secure_zero(body, sizeof(body));
         return send_user_error_page(
             request, "409 Conflict",
-            "Ya hay un cambio de contrasena Wi-Fi en curso.");
+            "Ya hay un reinicio del nodo en curso.");
     }
 
     char password[WIFI_CREDENTIALS_PASSWORD_MAX_LENGTH + 1] = {0};
@@ -863,14 +944,14 @@ static esp_err_t portal_save_handler(httpd_req_t *request)
             "La memoria no volatil rechazo el cambio. La clave anterior sigue activa.");
     }
 
-    err = schedule_password_apply();
+    err = schedule_node_restart(CONFIG_PORTAL_BOOT_MODE_NORMAL);
     if (err != ESP_OK) {
         return send_user_error_page(
             request, "500 Internal Server Error",
-            "La clave fue guardada, pero no se pudo aplicar al punto de acceso. Reinicie el nodo manualmente.");
+            "La clave fue guardada, pero no se pudo programar el reinicio. Reinicie el nodo manualmente.");
     }
 
-    ESP_LOGI(TAG, "Wi-Fi password saved; AP update scheduled");
+    ESP_LOGI(TAG, "Wi-Fi password saved; normal-mode restart scheduled");
     return send_html(request, "200 OK", WIFI_SUCCESS_HTML);
 }
 
@@ -933,7 +1014,66 @@ static esp_err_t portal_antenna_power_handler(httpd_req_t *request)
     return send_html(request, "200 OK", POWER_SUCCESS_HTML);
 }
 
-static esp_err_t portal_apply_power_handler(httpd_req_t *request)
+static bool form_get_rssi_threshold(const char *body, const char *field_name,
+                                    int8_t *rssi_threshold_dbm)
+{
+    char value[6] = {0};
+    if (!form_get_value(body, field_name, value, sizeof(value))) {
+        return false;
+    }
+
+    errno = 0;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' ||
+        !portal_settings_is_valid_rssi_threshold((int)parsed)) {
+        return false;
+    }
+
+    *rssi_threshold_dbm = (int8_t)parsed;
+    return true;
+}
+
+static esp_err_t portal_antenna_rssi_handler(httpd_req_t *request)
+{
+    char body[FORM_BODY_MAX_LENGTH + 1] = {0};
+    esp_err_t response_result = ESP_OK;
+    if (!validate_authenticated_form(request, body, sizeof(body),
+                                     &response_result)) {
+        return response_result;
+    }
+
+    portal_antenna_rssi_config_t config = {0};
+    bool parsed =
+        form_get_rssi_threshold(body, "rssi_north",
+                                &config.dbm[PORTAL_ANTENNA_NORTH]) &&
+        form_get_rssi_threshold(body, "rssi_south",
+                                &config.dbm[PORTAL_ANTENNA_SOUTH]) &&
+        form_get_rssi_threshold(body, "rssi_east",
+                                &config.dbm[PORTAL_ANTENNA_EAST]) &&
+        form_get_rssi_threshold(body, "rssi_west",
+                                &config.dbm[PORTAL_ANTENNA_WEST]);
+    secure_zero(body, sizeof(body));
+
+    if (!parsed) {
+        return send_admin_error_page(
+            request, "400 Bad Request",
+            "Cada limite RSSI debe estar entre -128 y -1 dBm.");
+    }
+
+    esp_err_t err = portal_settings_set_antenna_rssi_thresholds(&config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Antenna RSSI persistence failed: %s",
+                 esp_err_to_name(err));
+        return send_admin_error_page(
+            request, "500 Internal Server Error",
+            "La memoria no volatil rechazo los limites RSSI nuevos.");
+    }
+
+    return send_html(request, "200 OK", RSSI_SUCCESS_HTML);
+}
+
+static esp_err_t portal_apply_settings_handler(httpd_req_t *request)
 {
     char body[FORM_BODY_MAX_LENGTH + 1] = {0};
     esp_err_t response_result = ESP_OK;
@@ -943,26 +1083,52 @@ static esp_err_t portal_apply_power_handler(httpd_req_t *request)
     }
     secure_zero(body, sizeof(body));
 
-    portal_antenna_power_config_t config =
-        portal_settings_get_antenna_powers();
-    esp_err_t err = apply_powers_callback(
-        config.quarter_dbm, PORTAL_SETTINGS_ANTENNA_COUNT,
-        portal_callback_context);
+    esp_err_t err = schedule_node_restart(CONFIG_PORTAL_BOOT_MODE_NORMAL);
     if (err == ESP_ERR_INVALID_STATE) {
         return send_admin_error_page(
             request, "409 Conflict",
-            "El nodo no esta listo o ya tiene una distribucion de potencias en curso.");
+            "Ya hay un reinicio del nodo en curso.");
     }
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Unable to schedule antenna power update: %s",
+        ESP_LOGE(TAG, "Unable to schedule configuration restart: %s",
                  esp_err_to_name(err));
         return send_admin_error_page(
             request, "500 Internal Server Error",
-            "No se pudo iniciar la distribucion de potencias.");
+            "No se pudo programar el reinicio del nodo.");
     }
 
-    ESP_LOGW(TAG, "Antenna power distribution and node restart scheduled");
-    return send_html(request, "202 Accepted", POWER_APPLY_STARTED_HTML);
+    ESP_LOGW(TAG, "Normal-mode restart scheduled with saved antenna settings");
+    return send_html(request, "202 Accepted", SETTINGS_RESTART_STARTED_HTML);
+}
+
+static esp_err_t portal_orientation_mode_handler(httpd_req_t *request)
+{
+    char body[FORM_BODY_MAX_LENGTH + 1] = {0};
+    esp_err_t response_result = ESP_OK;
+    if (!validate_authenticated_form(request, body, sizeof(body),
+                                     &response_result)) {
+        return response_result;
+    }
+    secure_zero(body, sizeof(body));
+
+    esp_err_t err = schedule_node_restart(
+        CONFIG_PORTAL_BOOT_MODE_ORIENTATION);
+    if (err == ESP_ERR_INVALID_STATE) {
+        return send_admin_error_page(
+            request, "409 Conflict",
+            "Ya hay un reinicio del nodo en curso.");
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Unable to schedule orientation-mode restart: %s",
+                 esp_err_to_name(err));
+        return send_admin_error_page(
+            request, "500 Internal Server Error",
+            "No se pudo programar el modo orientacion.");
+    }
+
+    ESP_LOGW(TAG, "Orientation-mode restart scheduled from portal");
+    return send_html(request, "202 Accepted",
+                     ORIENTATION_RESTART_STARTED_HTML);
 }
 
 static esp_err_t portal_admin_password_handler(httpd_req_t *request)
@@ -1039,11 +1205,11 @@ static esp_err_t portal_factory_reset_handler(httpd_req_t *request)
         return response_result;
     }
 
-    if (password_apply_pending) {
+    if (restart_pending) {
         secure_zero(body, sizeof(body));
         return send_user_error_page(
             request, "409 Conflict",
-            "Ya hay un cambio de contrasena Wi-Fi en curso.");
+            "Ya hay un reinicio del nodo en curso.");
     }
 
     char confirmation[4] = {0};
@@ -1066,14 +1232,14 @@ static esp_err_t portal_factory_reset_handler(httpd_req_t *request)
             "La memoria no volatil rechazo el restablecimiento de la red.");
     }
 
-    err = schedule_password_apply();
+    err = schedule_node_restart(CONFIG_PORTAL_BOOT_MODE_NORMAL);
     if (err != ESP_OK) {
         return send_user_error_page(
             request, "500 Internal Server Error",
-            "La configuracion fue borrada, pero no se pudo actualizar el punto de acceso. Reinicie el nodo manualmente.");
+            "La configuracion fue borrada, pero no se pudo programar el reinicio. Reinicie el nodo manualmente.");
     }
 
-    ESP_LOGW(TAG, "Wi-Fi factory reset requested; AP update scheduled");
+    ESP_LOGW(TAG, "Wi-Fi factory reset requested; normal-mode restart scheduled");
     return send_html(request, "200 OK", FACTORY_RESET_SUCCESS_HTML);
 }
 
@@ -1133,9 +1299,21 @@ static esp_err_t register_portal_handlers(void)
             .user_ctx = NULL,
         },
         {
-            .uri = "/admin/apply-powers",
+            .uri = "/admin/antenna-rssi",
             .method = HTTP_POST,
-            .handler = portal_apply_power_handler,
+            .handler = portal_antenna_rssi_handler,
+            .user_ctx = NULL,
+        },
+        {
+            .uri = "/admin/apply-settings",
+            .method = HTTP_POST,
+            .handler = portal_apply_settings_handler,
+            .user_ctx = NULL,
+        },
+        {
+            .uri = "/admin/orientation-mode",
+            .method = HTTP_POST,
+            .handler = portal_orientation_mode_handler,
             .user_ctx = NULL,
         },
         {
@@ -1170,11 +1348,9 @@ static esp_err_t register_portal_handlers(void)
     return ESP_OK;
 }
 
-static esp_err_t config_portal_start(void)
+static esp_err_t config_portal_start_http(void)
 {
     if (portal_server != NULL) {
-        portal_started_at_us = esp_timer_get_time();
-        ESP_LOGI(TAG, "Configuration portal activation extended");
         return ESP_OK;
     }
 
@@ -1186,7 +1362,7 @@ static esp_err_t config_portal_start(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.stack_size = 8192;
-    config.max_uri_handlers = 9;
+    config.max_uri_handlers = 11;
     config.lru_purge_enable = true;
 
     esp_err_t err = httpd_start(&portal_server, &config);
@@ -1210,9 +1386,9 @@ static esp_err_t config_portal_start(void)
 
     portal_started_at_us = esp_timer_get_time();
 
-    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
     esp_netif_ip_info_t ip_info;
-    if (netif != NULL && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
+    if (portal_netif != NULL &&
+        esp_netif_get_ip_info(portal_netif, &ip_info) == ESP_OK) {
         ESP_LOGW(TAG, "Wi-Fi password portal enabled for five minutes at http://" IPSTR "/",
                   IP2STR(&ip_info.ip));
         ESP_LOGW(TAG, "Administrator portal available at http://" IPSTR "/admin",
@@ -1226,12 +1402,11 @@ static esp_err_t config_portal_start(void)
 
 static void config_portal_stop(void)
 {
-    if (portal_server == NULL) {
-        return;
+    if (portal_server != NULL) {
+        httpd_stop(portal_server);
+        portal_server = NULL;
     }
 
-    httpd_stop(portal_server);
-    portal_server = NULL;
     portal_started_at_us = 0;
     invalidate_session();
     secure_zero(user_csrf_token, sizeof(user_csrf_token));
@@ -1240,24 +1415,75 @@ static void config_portal_stop(void)
     ESP_LOGI(TAG, "Configuration portal and administrator session disabled");
 }
 
+static esp_err_t config_portal_start_access_point(void)
+{
+    portal_netif = esp_netif_create_default_wifi_ap();
+    if (portal_netif == NULL) {
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = esp_netif_dhcps_stop(portal_netif);
+    if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) {
+        return err;
+    }
+
+    esp_netif_ip_info_t ip_info = {
+        .ip = {.addr = ESP_IP4TOADDR(192, 168, 4, 1)},
+        .gw = {.addr = ESP_IP4TOADDR(192, 168, 4, 1)},
+        .netmask = {.addr = ESP_IP4TOADDR(255, 255, 255, 0)},
+    };
+    err = esp_netif_set_ip_info(portal_netif, &ip_info);
+    if (err == ESP_OK) {
+        err = esp_netif_dhcps_start(portal_netif);
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    wifi_config_t wifi_config = {0};
+    memcpy(wifi_config.ap.ssid, CONFIG_PORTAL_AP_SSID,
+           sizeof(CONFIG_PORTAL_AP_SSID));
+    wifi_config.ap.ssid_len = strlen(CONFIG_PORTAL_AP_SSID);
+    wifi_config.ap.channel = CONFIG_PORTAL_AP_CHANNEL;
+    wifi_config.ap.max_connection = CONFIG_PORTAL_AP_MAX_CONNECTIONS;
+    wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+    wifi_config.ap.pmf_cfg.required = false;
+
+    err = esp_wifi_set_mode(WIFI_MODE_AP);
+    if (err == ESP_OK) {
+        err = esp_wifi_set_config(WIFI_IF_AP, &wifi_config);
+    }
+    if (err == ESP_OK) {
+        err = esp_wifi_start();
+    }
+    if (err == ESP_OK) {
+        ESP_LOGW(TAG, "Configuration AP started: SSID=%s IP=%s",
+                 CONFIG_PORTAL_AP_SSID, CONFIG_PORTAL_IP);
+    }
+    return err;
+}
+
+static void request_configuration_mode(void)
+{
+    esp_err_t err = schedule_node_restart(
+        CONFIG_PORTAL_BOOT_MODE_CONFIGURATION);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Unable to schedule configuration-mode restart: %s",
+                  esp_err_to_name(err));
+    }
+}
+
 static void restore_factory_credentials(void)
 {
-    config_portal_stop();
-
     esp_err_t err = wifi_credentials_factory_reset();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi factory reset failed: %s", esp_err_to_name(err));
         return;
     }
 
-    err = apply_password_callback("", portal_callback_context);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Factory Wi-Fi credentials saved but AP update failed: %s",
-                 esp_err_to_name(err));
-        return;
-    }
-
-    ESP_LOGW(TAG, "Wi-Fi factory reset complete; administrator settings preserved");
+    config_portal_next_boot_marker = 0;
+    ESP_LOGW(TAG,
+             "Wi-Fi factory reset complete; antenna and administrator settings preserved");
 }
 
 static void boot_button_task(void *argument)
@@ -1275,10 +1501,12 @@ static void boot_button_task(void *argument)
         int64_t now_us = esp_timer_get_time();
         bool sampled_pressed = gpio_get_level(BOOT_BUTTON_GPIO) == 0;
 
-        if (portal_server != NULL && !password_apply_pending &&
+        if (portal_mode_active && !restart_pending &&
             now_us - portal_started_at_us >=
                 (int64_t)PORTAL_TIMEOUT_MS * 1000) {
-            config_portal_stop();
+            ESP_LOGW(TAG,
+                     "Configuration portal timeout; restarting in normal mode");
+            schedule_node_restart(CONFIG_PORTAL_BOOT_MODE_NORMAL);
         }
 
         if (sampled_pressed != raw_pressed) {
@@ -1297,8 +1525,19 @@ static void boot_button_task(void *argument)
                 pressed_at_us = now_us;
             } else if (press_active) {
                 if (!factory_reset_handled) {
-                    ESP_LOGI(TAG, "Short BOOT press detected; opening Wi-Fi and administrator portals");
-                    config_portal_start();
+                    if (portal_mode_active) {
+                        ESP_LOGI(TAG,
+                                 "Short BOOT press detected; leaving configuration mode");
+                        schedule_node_restart(CONFIG_PORTAL_BOOT_MODE_NORMAL);
+                    } else {
+                        ESP_LOGI(TAG,
+                                 "Short BOOT press detected; restarting in configuration mode");
+                        request_configuration_mode();
+                    }
+                } else {
+                    ESP_LOGI(TAG,
+                             "BOOT released after factory reset; restarting in normal mode");
+                    schedule_node_restart(CONFIG_PORTAL_BOOT_MODE_NORMAL);
                 }
 
                 press_active = false;
@@ -1319,26 +1558,11 @@ static void boot_button_task(void *argument)
     }
 }
 
-esp_err_t config_portal_init(config_portal_apply_password_cb_t apply_password,
-                             config_portal_apply_powers_cb_t apply_powers,
-                             void *context)
+static esp_err_t start_boot_button_task(void)
 {
-    if (apply_password == NULL || apply_powers == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
     if (button_task_handle != NULL) {
         return ESP_OK;
     }
-
-    esp_err_t err = portal_settings_init();
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    apply_password_callback = apply_password;
-    apply_powers_callback = apply_powers;
-    portal_callback_context = context;
 
     gpio_config_t button_config = {
         .pin_bit_mask = 1ULL << BOOT_BUTTON_GPIO,
@@ -1347,7 +1571,7 @@ esp_err_t config_portal_init(config_portal_apply_password_cb_t apply_password,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    err = gpio_config(&button_config);
+    esp_err_t err = gpio_config(&button_config);
     if (err != ESP_OK) {
         return err;
     }
@@ -1366,6 +1590,51 @@ esp_err_t config_portal_init(config_portal_apply_password_cb_t apply_password,
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "Configuration portal BOOT-button monitor initialized");
+    ESP_LOGI(TAG, "Configuration BOOT-button monitor initialized");
     return ESP_OK;
+}
+
+config_portal_boot_mode_t config_portal_take_boot_mode_request(void)
+{
+    config_portal_boot_mode_t requested_mode =
+        CONFIG_PORTAL_BOOT_MODE_NORMAL;
+    if (config_portal_next_boot_marker ==
+        CONFIG_PORTAL_BOOT_CONFIGURATION_MAGIC) {
+        requested_mode = CONFIG_PORTAL_BOOT_MODE_CONFIGURATION;
+    } else if (config_portal_next_boot_marker ==
+               CONFIG_PORTAL_BOOT_ORIENTATION_MAGIC) {
+        requested_mode = CONFIG_PORTAL_BOOT_MODE_ORIENTATION;
+    }
+
+    config_portal_next_boot_marker = 0;
+    return requested_mode;
+}
+
+esp_err_t config_portal_start_button_monitor(void)
+{
+    portal_mode_active = false;
+    restart_pending = false;
+    return start_boot_button_task();
+}
+
+esp_err_t config_portal_run(void)
+{
+    portal_mode_active = true;
+    restart_pending = false;
+
+    esp_err_t err = portal_settings_init();
+    if (err == ESP_OK) {
+        err = config_portal_start_access_point();
+    }
+    if (err == ESP_OK) {
+        err = config_portal_start_http();
+    }
+    if (err == ESP_OK) {
+        err = start_boot_button_task();
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Unable to start configuration mode: %s",
+                 esp_err_to_name(err));
+    }
+    return err;
 }

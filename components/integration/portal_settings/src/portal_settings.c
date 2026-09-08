@@ -14,6 +14,7 @@
 #define ADMIN_PASSWORD_HASH_KEY "pwd_hash"
 #define ADMIN_PASSWORD_CHANGED_KEY "pwd_custom"
 #define ANTENNA_POWER_KEY "ant_power"
+#define ANTENNA_RSSI_KEY "ant_rssi"
 
 #define ADMIN_PASSWORD_INITIAL "i4a12345"
 #define ADMIN_PASSWORD_SALT_LENGTH 16
@@ -25,6 +26,7 @@ static const char *TAG = "portal_settings";
 static uint8_t admin_password_salt[ADMIN_PASSWORD_SALT_LENGTH];
 static uint8_t admin_password_hash[ADMIN_PASSWORD_HASH_LENGTH];
 static portal_antenna_power_config_t antenna_powers;
+static portal_antenna_rssi_config_t antenna_rssi_thresholds;
 static bool admin_password_changed = false;
 static bool initialized = false;
 
@@ -195,6 +197,35 @@ static void set_default_antenna_powers(void)
     }
 }
 
+bool portal_settings_is_valid_rssi_threshold(int rssi_dbm)
+{
+    return rssi_dbm >= INT8_MIN && rssi_dbm <= -1;
+}
+
+static bool antenna_rssi_thresholds_are_valid(
+    const portal_antenna_rssi_config_t *config)
+{
+    if (config == NULL) {
+        return false;
+    }
+
+    for (size_t index = 0; index < PORTAL_SETTINGS_ANTENNA_COUNT; index++) {
+        if (!portal_settings_is_valid_rssi_threshold(config->dbm[index])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void set_default_antenna_rssi_thresholds(void)
+{
+    for (size_t index = 0; index < PORTAL_SETTINGS_ANTENNA_COUNT; index++) {
+        antenna_rssi_thresholds.dbm[index] =
+            PORTAL_SETTINGS_DEFAULT_RSSI_THRESHOLD_DBM;
+    }
+}
+
 esp_err_t portal_settings_init(void)
 {
     if (initialized) {
@@ -251,6 +282,23 @@ esp_err_t portal_settings_init(void)
         }
     }
 
+    if (err == ESP_OK) {
+        bool thresholds_found = false;
+        bool thresholds_valid = load_exact_blob(
+            handle, ANTENNA_RSSI_KEY, &antenna_rssi_thresholds,
+            sizeof(antenna_rssi_thresholds), &thresholds_found);
+        if (!thresholds_valid || !thresholds_found ||
+            !antenna_rssi_thresholds_are_valid(&antenna_rssi_thresholds)) {
+            ESP_LOGW(TAG,
+                     "Antenna RSSI thresholds are not initialized; accepting all signals");
+            set_default_antenna_rssi_thresholds();
+            err = nvs_set_blob(handle, ANTENNA_RSSI_KEY,
+                               &antenna_rssi_thresholds,
+                               sizeof(antenna_rssi_thresholds));
+            needs_commit = err == ESP_OK;
+        }
+    }
+
     if (err == ESP_OK && needs_commit) {
         err = nvs_commit(handle);
     }
@@ -265,7 +313,7 @@ esp_err_t portal_settings_init(void)
     }
 
     initialized = true;
-    ESP_LOGI(TAG, "Administrator verifier and antenna powers loaded");
+    ESP_LOGI(TAG, "Administrator verifier and antenna settings loaded");
     return ESP_OK;
 }
 
@@ -382,5 +430,47 @@ esp_err_t portal_settings_set_antenna_powers(
 
     memcpy(&antenna_powers, config, sizeof(antenna_powers));
     ESP_LOGI(TAG, "Directional antenna powers updated in NVS");
+    return ESP_OK;
+}
+
+portal_antenna_rssi_config_t portal_settings_get_antenna_rssi_thresholds(void)
+{
+    return antenna_rssi_thresholds;
+}
+
+esp_err_t portal_settings_set_antenna_rssi_thresholds(
+    const portal_antenna_rssi_config_t *config)
+{
+    if (!initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!antenna_rssi_thresholds_are_valid(config)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (memcmp(&antenna_rssi_thresholds, config, sizeof(*config)) == 0) {
+        return ESP_OK;
+    }
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(PORTAL_SETTINGS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_blob(handle, ANTENNA_RSSI_KEY, config, sizeof(*config));
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Unable to persist antenna RSSI thresholds: %s",
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    memcpy(&antenna_rssi_thresholds, config,
+           sizeof(antenna_rssi_thresholds));
+    ESP_LOGI(TAG, "Directional antenna RSSI thresholds updated in NVS");
     return ESP_OK;
 }

@@ -14,6 +14,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_netif_ip_addr.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -23,9 +24,11 @@
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 #include "node.h"
+#include "reset_manager/reset_manager.h"
 
 #define AOM_MODE_GPIO GPIO_NUM_33
 #define AOM_MODE_ACTIVE_LEVEL 0
+#define AOM_ENABLE_GPIO33_SELECTION 0
 #define AOM_FORCE_ORIENTATION_MODE 0
 
 #define AOM_AP_SSID "Orientacion_Antenas"
@@ -53,6 +56,9 @@
 #define AOM_WEB_REFRESH_MS 5000
 #define AOM_START_PERIOD_MS 2000
 #define AOM_SCAN_STAGGER_MS 180
+#define AOM_RESTART_DELAY_MS 1000
+#define AOM_RESET_BROADCAST_WAIT_MS 2500
+#define AOM_RESET_RETRY_COUNT 20
 
 #define AOM_DIRECTIONAL_COUNT 4
 #define AOM_MAX_REPORT_ENTRIES 8
@@ -127,6 +133,7 @@ static const char *const AOM_ORIENTATION_NAMES[AOM_DIRECTIONAL_COUNT] = {
 
 static aom_context_t *s_aom = NULL;
 static esp_netif_t *s_ap_netif = NULL;
+static volatile bool s_restart_pending = false;
 
 static const char AOM_PORTAL_HTML[] =
     "<!doctype html><html lang=\"es\"><head><meta charset=\"utf-8\">"
@@ -140,11 +147,16 @@ static const char AOM_PORTAL_HTML[] =
     "table{width:100%;border-collapse:collapse;margin-top:22px}"
     "th,td{text-align:left;padding:11px;border-bottom:1px solid #cbd5e1}"
     "th{color:#075985}#status{font-size:.9rem;color:#64748b}"
+    "button{width:100%;margin-top:24px;padding:13px;border:0;border-radius:9px;"
+    "background:#92400e;color:#fff;font-weight:700;font-size:1rem}"
     "</style></head><body><main><h1>Orientacion de antenas</h1>"
     "<p>Redes detectadas cuyo SSID comienza con <strong>I4A</strong>.</p>"
     "<div id=\"status\">Esperando reportes...</div>"
     "<table><thead><tr><th>Antena</th><th>SSID</th><th>RSSI</th>"
     "<th>Canal</th><th>Hace</th></tr></thead><tbody id=\"rows\"></tbody></table>"
+    "<form method=\"post\" action=\"/exit\" "
+    "onsubmit=\"return confirm('Finalizar la orientacion y reiniciar los cinco ESP32?')\">"
+    "<button type=\"submit\">Finalizar orientacion y reiniciar normalmente</button></form>"
     "<script>"
     "function cell(v){var d=document.createElement('td');d.textContent=v;return d;}"
     "function addRow(o,s,r,c,a){var tr=document.createElement('tr');"
@@ -166,11 +178,23 @@ static const char AOM_PORTAL_HTML[] =
     "refresh();setInterval(refresh," AOM_STRINGIFY(AOM_WEB_REFRESH_MS) ");"
     "</script></main></body></html>";
 
+static const char AOM_EXIT_HTML[] =
+    "<!doctype html><html lang=\"es\"><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<title>Orientacion de antenas</title></head><body style=\"font-family:system-ui;margin:2rem\">"
+    "<h1>Reinicio programado</h1>"
+    "<p>El nodo saldra del modo orientacion y arrancara normalmente.</p>"
+    "</body></html>";
+
 static bool aom_is_central(void) {
     return node_get_device_orientation() == NODE_DEVICE_ORIENTATION_CENTER;
 }
 
 bool antenna_orientation_mode_pin_is_active(void) {
+#if AOM_FORCE_ORIENTATION_MODE
+    ESP_LOGW(TAG, "modo orientacion forzado por software");
+    return true;
+#elif AOM_ENABLE_GPIO33_SELECTION
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << AOM_MODE_GPIO),
         .mode = GPIO_MODE_INPUT,
@@ -182,15 +206,18 @@ bool antenna_orientation_mode_pin_is_active(void) {
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "no se pudo configurar GPIO%d: %s", AOM_MODE_GPIO,
                  esp_err_to_name(err));
-        return AOM_FORCE_ORIENTATION_MODE != 0;
+        return false;
     }
 
     int level = gpio_get_level(AOM_MODE_GPIO);
-    bool active = AOM_FORCE_ORIENTATION_MODE != 0 ||
-                  level == AOM_MODE_ACTIVE_LEVEL;
+    bool active = level == AOM_MODE_ACTIVE_LEVEL;
     ESP_LOGI(TAG, "pin modo orientacion GPIO=%d level=%d active=%d",
              AOM_MODE_GPIO, level, active);
     return active;
+#else
+    ESP_LOGI(TAG, "seleccion de orientacion por GPIO33 desactivada");
+    return false;
+#endif
 }
 
 static size_t aom_report_message_length(uint8_t entry_count) {
@@ -570,6 +597,43 @@ static bool aom_path_serves_portal(const char *path) {
     return false;
 }
 
+static void aom_restart_normal_task(void *argument) {
+    (void)argument;
+    vTaskDelay(pdMS_TO_TICKS(AOM_RESTART_DELAY_MS));
+
+    bool reset_broadcasted = false;
+    for (size_t attempt = 0;
+         attempt < AOM_RESET_RETRY_COUNT && !reset_broadcasted; attempt++) {
+        reset_broadcasted = rm_broadcast_reset();
+        if (!reset_broadcasted) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+    if (!reset_broadcasted) {
+        ESP_LOGW(TAG,
+                 "reinicio no recorrio todo el anillo; el central reintentara al arrancar");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(AOM_RESET_BROADCAST_WAIT_MS));
+    esp_restart();
+}
+
+static esp_err_t aom_schedule_normal_restart(void) {
+    if (s_restart_pending) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_restart_pending = true;
+    if (xTaskCreate(aom_restart_normal_task, "aom_restart",
+                    AOM_SERVICE_TASK_STACK, NULL, AOM_TASK_PRIORITY,
+                    NULL) != pdPASS) {
+        s_restart_pending = false;
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
+}
+
 static void aom_handle_http_client(int client_sock) {
     char request[AOM_HTTP_REQUEST_LENGTH];
     int received = recv(client_sock, request, sizeof(request) - 1, 0);
@@ -590,7 +654,22 @@ static void aom_handle_http_client(int client_sock) {
     if (query != NULL) {
         *query = '\0';
     }
-    if (strcmp(method, "GET") != 0) {
+    if (strcmp(method, "POST") == 0 && strcmp(path, "/exit") == 0) {
+        esp_err_t err = aom_schedule_normal_restart();
+        if (err == ESP_OK) {
+            aom_send_http_response(client_sock, "202 Accepted",
+                                   "text/html; charset=utf-8",
+                                   AOM_EXIT_HTML,
+                                   sizeof(AOM_EXIT_HTML) - 1);
+        } else if (err == ESP_ERR_INVALID_STATE) {
+            aom_send_http_response(client_sock, "409 Conflict", "text/plain",
+                                   "Restart already scheduled", 25);
+        } else {
+            aom_send_http_response(client_sock,
+                                   "500 Internal Server Error", "text/plain",
+                                   "Unable to schedule restart", 26);
+        }
+    } else if (strcmp(method, "GET") != 0) {
         aom_send_http_response(client_sock, "405 Method Not Allowed",
                                "text/plain", "Method Not Allowed", 18);
     } else if (strcmp(path, "/api/reports") == 0) {

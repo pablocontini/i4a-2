@@ -11,6 +11,7 @@
 #include "traffic.h"
 #include "remote_control.h"
 #include "config_portal/config_portal.h"
+#include "portal_settings/portal_settings.h"
 #include "wifi_credentials/wifi_credentials.h"
 #include "node.h"
 
@@ -37,6 +38,7 @@ bool antenna_orientation_mode_pin_is_active(void);
 
 static const char *TAG = "node";
 static bool s_orientation_mode_requested = false;
+static bool s_configuration_mode_requested = false;
 
 typedef struct node {
   DevicePtr node_device_ptr;
@@ -70,6 +72,14 @@ bool node_is_orientation_mode_enabled(void) {
   return s_orientation_mode_requested;
 }
 
+void node_set_configuration_mode_requested(bool enabled) {
+  s_configuration_mode_requested = enabled;
+}
+
+bool node_is_configuration_mode_enabled(void) {
+  return s_configuration_mode_requested;
+}
+
 static node_device_orientation_t node_get_config_orientation(void){
   config_id_t config_bits = config_get_id();
     if ((config_bits >> 2) == 0) {
@@ -77,34 +87,6 @@ static node_device_orientation_t node_get_config_orientation(void){
   } else {
       return NODE_DEVICE_ORIENTATION_CENTER;
   }
-}
-
-static esp_err_t node_apply_house_ap_password(const char *password, void *context) {
-  DevicePtr device_ptr = (DevicePtr)context;
-
-  if (password == NULL || device_ptr == NULL || device_ptr->mode != AP ||
-      device_ptr->state != d_active || device_ptr->access_point_ptr == NULL ||
-      !ap_is_initialized(device_ptr->access_point_ptr)) {
-    ESP_LOGE(TAG, "Cannot apply ComNetAR password: AP is not active");
-    return ESP_ERR_INVALID_STATE;
-  }
-
-  ap_set_password(device_ptr->access_point_ptr, password);
-  ap_update(device_ptr->access_point_ptr);
-  ESP_LOGI(TAG, "ComNetAR AP credentials applied without restarting the node");
-  return ESP_OK;
-}
-
-static esp_err_t node_schedule_antenna_power_update(
-    const uint8_t *power_qdbm, size_t count, void *context) {
-  (void)context;
-
-  if (node_ptr->node_device_orientation != NODE_DEVICE_ORIENTATION_CENTER ||
-      node_ptr->node_device_is_center_root) {
-    return ESP_ERR_INVALID_STATE;
-  }
-
-  return rm_schedule_antenna_power_update(power_qdbm, count);
 }
 
 void node_setup(void){
@@ -122,13 +104,26 @@ void node_setup(void){
   vTaskDelay(pdMS_TO_TICKS(node_ptr->node_device_orientation * CALIBRATION_DELAY_SECONDS * 1000));
 
   ESP_ERROR_CHECK(device_wifi_init());
-  ESP_ERROR_CHECK(rm_power_storage_init());
   ESP_ERROR_CHECK(wifi_credentials_init());
   ESP_ERROR_CHECK(ring_link_init());
 
   if(node_ptr->node_device_orientation == NODE_DEVICE_ORIENTATION_CENTER) {
-    bool orientation_mode = antenna_orientation_mode_pin_is_active();
+    ESP_ERROR_CHECK(portal_settings_init());
+
+    bool is_root = config_mode_is(CONFIG_MODE_ROOT);
+    config_portal_boot_mode_t requested_boot_mode =
+        config_portal_take_boot_mode_request();
+    bool orientation_mode = antenna_orientation_mode_pin_is_active() ||
+        requested_boot_mode == CONFIG_PORTAL_BOOT_MODE_ORIENTATION;
+    bool configuration_mode = !orientation_mode && !is_root &&
+        requested_boot_mode == CONFIG_PORTAL_BOOT_MODE_CONFIGURATION;
     node_set_orientation_mode_requested(orientation_mode);
+    node_set_configuration_mode_requested(configuration_mode);
+
+    portal_antenna_power_config_t powers =
+        portal_settings_get_antenna_powers();
+    portal_antenna_rssi_config_t rssi_thresholds =
+        portal_settings_get_antenna_rssi_thresholds();
 
     while (!rm_broadcast_reset()) {
       vTaskDelay(pdMS_TO_TICKS(100));
@@ -136,8 +131,9 @@ void node_setup(void){
 
     vTaskDelay(pdMS_TO_TICKS(10000)); // Wait 10 seconds so all the devices come back up in case this was an actual node reset
 
-    while (!rm_broadcast_startup_info(config_mode_is(CONFIG_MODE_ROOT),
-                                      orientation_mode)) {
+    while (!rm_broadcast_startup_info(
+        is_root, orientation_mode, configuration_mode,
+        powers.quarter_dbm, rssi_thresholds.dbm)) {
       vTaskDelay(pdMS_TO_TICKS(100));
     }
 
@@ -156,19 +152,18 @@ void node_setup(void){
   node_ptr->node_device_uuid = rm_get_uuid();
   node_ptr->node_device_is_center_root = rm_is_root();
   node_ptr->node_device_is_apsta = false;
-  if (!node_is_orientation_mode_enabled()) {
+  if (!node_is_orientation_mode_enabled() &&
+      !node_is_configuration_mode_enabled()) {
     node_traffic_init();
     im_scheduler_start();
 
     if (node_ptr->node_device_orientation == NODE_DEVICE_ORIENTATION_CENTER &&
         !node_ptr->node_device_is_center_root) {
-      ESP_ERROR_CHECK(config_portal_init(node_apply_house_ap_password,
-                                         node_schedule_antenna_power_update,
-                                         node_ptr->node_device_ptr));
+      ESP_ERROR_CHECK(config_portal_start_button_monitor());
     }
   } else {
     ESP_LOGI(TAG,
-             "Orientation mode active: skipping normal traffic, scheduler and configuration portal");
+             "Special startup mode active: skipping normal traffic and scheduler");
   }
 }
 
@@ -187,6 +182,8 @@ void node_set_as_sta(){
   device_start_station(node_ptr->node_device_ptr);
   device_set_max_tx_power(node_ptr->node_device_ptr,
                           rm_get_local_antenna_power());
+  device_set_rssi_threshold(node_ptr->node_device_ptr,
+                            rm_get_local_rssi_threshold());
   device_connect_station(node_ptr->node_device_ptr);
 }
 

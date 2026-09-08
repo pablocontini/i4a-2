@@ -366,6 +366,19 @@ void device_set_max_tx_power(DevicePtr device_ptr, int8_t power) {
   ESP_LOGI(LOGGING_TAG, "Wi-Fi max TX power set to %.2f dBm", real_dbm);
 }
 
+void device_set_rssi_threshold(DevicePtr device_ptr,
+                               int8_t rssi_threshold_dbm) {
+  if (device_ptr == NULL || device_ptr->mode != STATION ||
+      device_ptr->station_ptr == NULL) {
+    ESP_LOGW(LOGGING_TAG,
+             "Cannot set RSSI threshold: station is not initialized");
+    return;
+  }
+
+  station_set_rssi_threshold(device_ptr->station_ptr,
+                             rssi_threshold_dbm);
+}
+
 // Disable STA interface at runtime
 void device_disable_station(DevicePtr device_ptr) {
   if (device_ptr == NULL) {

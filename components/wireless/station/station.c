@@ -16,7 +16,7 @@
 #define SSID_ORIENTATION_OFFSET 4
 
 #define MAX_RETRIES 10
-#define RSSI_THRESHOLD -128 // Minimum RSSI (in dBm) required to consider an AP as available
+#define DEFAULT_RSSI_THRESHOLD_DBM (-128)
 
 static const char* LOGGING_TAG = "station";
 
@@ -70,6 +70,7 @@ void station_init(StationPtr stationPtr, const char* wifi_ssid_like, uint8_t ori
   stationPtr->ap_found = false;
   stationPtr->is_fully_connected = false;
   stationPtr->is_apsta = is_apsta;
+  stationPtr->rssi_threshold_dbm = DEFAULT_RSSI_THRESHOLD_DBM;
   stationPtr->initialized = true;
 
   esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
@@ -87,11 +88,11 @@ void station_find_ap(StationPtr stationPtr) {
   wifi_ap_record_t ap;
   wifi_ap_record_t best_ap;
   bool found = false;
-  int best_rssi = RSSI_THRESHOLD;
+  int best_rssi = stationPtr->rssi_threshold_dbm;
 
   while (esp_wifi_scan_get_ap_record(&ap) == ESP_OK) {
 
-    if (ap.rssi < RSSI_THRESHOLD) {
+    if (ap.rssi < stationPtr->rssi_threshold_dbm) {
       continue;
     }
 
@@ -271,7 +272,7 @@ int8_t station_scan_best_rssi(StationPtr stationPtr) {
 
   while (esp_wifi_scan_get_ap_record(&ap) == ESP_OK) {
 
-    if (ap.rssi < RSSI_THRESHOLD) {
+    if (ap.rssi < stationPtr->rssi_threshold_dbm) {
       continue;
     }
 
@@ -286,4 +287,18 @@ int8_t station_scan_best_rssi(StationPtr stationPtr) {
   }
 
   return best_rssi;
+}
+
+void station_set_rssi_threshold(StationPtr stationPtr,
+                                int8_t rssi_threshold_dbm) {
+  if (stationPtr == NULL || !stationPtr->initialized ||
+      rssi_threshold_dbm > -1) {
+    ESP_LOGW(LOGGING_TAG, "Invalid RSSI threshold: %d dBm",
+             (int)rssi_threshold_dbm);
+    return;
+  }
+
+  stationPtr->rssi_threshold_dbm = rssi_threshold_dbm;
+  ESP_LOGI(LOGGING_TAG, "Minimum accepted RSSI set to %d dBm",
+           (int)rssi_threshold_dbm);
 }
